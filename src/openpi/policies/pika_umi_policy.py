@@ -19,24 +19,35 @@ def _parse_image(image) -> np.ndarray:
 @dataclasses.dataclass(frozen=True)
 class PikaUmiInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
+    # If true, also feed the RealSense depth (pre-encoded as a normalized 3-channel
+    # image by the converter) as extra `*_wrist_0_depth` camera inputs (RGB-D).
+    include_depth: bool = False
 
     def __call__(self, data: dict) -> dict:
         left_wrist = _parse_image(data["observation/left_wrist_0_rgb"])
         right_wrist = _parse_image(data["observation/right_wrist_0_rgb"])
         base_image = np.zeros_like(left_wrist)
 
+        images = {
+            "base_0_rgb": base_image,
+            "left_wrist_0_rgb": left_wrist,
+            "right_wrist_0_rgb": right_wrist,
+        }
+        image_mask = {
+            "base_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+            "left_wrist_0_rgb": np.True_,
+            "right_wrist_0_rgb": np.True_,
+        }
+        if self.include_depth:
+            images["left_wrist_0_depth"] = _parse_image(data["observation/left_wrist_0_depth"])
+            images["right_wrist_0_depth"] = _parse_image(data["observation/right_wrist_0_depth"])
+            image_mask["left_wrist_0_depth"] = np.True_
+            image_mask["right_wrist_0_depth"] = np.True_
+
         inputs = {
             "state": data["observation/state"],
-            "image": {
-                "base_0_rgb": base_image,
-                "left_wrist_0_rgb": left_wrist,
-                "right_wrist_0_rgb": right_wrist,
-            },
-            "image_mask": {
-                "base_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
-                "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_,
-            },
+            "image": images,
+            "image_mask": image_mask,
         }
 
         if "actions" in data:

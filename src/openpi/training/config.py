@@ -468,23 +468,26 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotPikaUmiDataConfig(DataConfigFactory):
+    # If true, also load the RealSense depth (pre-encoded as 3-channel images by the
+    # converter) as extra `*_wrist_0_depth` camera inputs (RGB-D). Requires a dataset
+    # converted with depth and a model whose `image_keys` include the depth keys.
+    include_depth: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/left_wrist_0_rgb": "left_wrist_0_rgb",
-                        "observation/right_wrist_0_rgb": "right_wrist_0_rgb",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        repack_map = {
+            "observation/left_wrist_0_rgb": "left_wrist_0_rgb",
+            "observation/right_wrist_0_rgb": "right_wrist_0_rgb",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.include_depth:
+            repack_map["observation/left_wrist_0_depth"] = "left_wrist_0_depth"
+            repack_map["observation/right_wrist_0_depth"] = "right_wrist_0_depth"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
         data_transforms = _transforms.Group(
-            inputs=[pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type)],
+            inputs=[pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth)],
             outputs=[pika_umi_policy.PikaUmiOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
@@ -985,6 +988,42 @@ _CONFIGS = [
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_openpi_train",
             assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                image_aug=_transforms.ImageTransformConfig(),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # RGB-D variant: same as pi05_pika_umi_aug (h8, relrel, aug) but also feeds the
+    # RealSense depth as two extra `*_wrist_0_depth` camera inputs (model.image_keys +
+    # data.include_depth). Needs a depth-converted dataset (plaif/pika_umi_openpi_rgbd)
+    # and its own norm stats (compute_norm_stats after convert). aug stays RGB-only.
+    TrainConfig(
+        name="pi05_pika_umi_rgbd",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=8,
+            image_keys=(
+                "base_0_rgb",
+                "left_wrist_0_rgb",
+                "right_wrist_0_rgb",
+                "left_wrist_0_depth",
+                "right_wrist_0_depth",
+            ),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_openpi_rgbd",
+            include_depth=True,
             base_config=DataConfig(
                 prompt_from_task=True,
                 image_aug=_transforms.ImageTransformConfig(),

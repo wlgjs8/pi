@@ -30,6 +30,28 @@ def _decode_jpeg(encoded: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
+def _decode_depth(encoded: np.ndarray) -> np.ndarray:
+    """Decode a 16-bit RealSense depth frame (millimetres) to a uint16 HxW array."""
+    depth = cv2.imdecode(np.asarray(encoded, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        raise ValueError("Failed to decode depth frame")
+    return depth
+
+
+def _depth_to_image(depth_u16: np.ndarray, z_near_mm: float = 120.0, z_far_mm: float = 700.0) -> np.ndarray:
+    """Normalize metric depth (mm) into a 3-channel uint8 image for the SigLIP encoder.
+
+    Clips to the [z_near, z_far] grasp working volume (near->0, far->255), treats invalid
+    (hole, depth==0) pixels as far, and grayscale-replicates to 3 channels to preserve
+    monotonic metric ordering. Tune z_near/z_far to the bolt-grasp depth range."""
+    d = depth_u16.astype(np.float32)
+    valid = d > 0
+    d = np.clip((d - z_near_mm) / (z_far_mm - z_near_mm), 0.0, 1.0)
+    d[~valid] = 1.0
+    g = (d * 255.0).astype(np.uint8)
+    return np.repeat(g[..., None], 3, axis=2)
+
+
 def _state(left_pose: np.ndarray, right_pose: np.ndarray, left_grip: np.ndarray, right_grip: np.ndarray) -> np.ndarray:
     # RESET-RELATIVE proprio (v3): each frame pose relative to the episode-first
     # frame, expressed in the reset body frame -- per arm pos_rel(3), rotvec_rel(3),
@@ -92,6 +114,7 @@ def main(
     ),
     repo_id: str = REPO_ID,
     summary_path: pathlib.Path = pathlib.Path("/home/plaif/workspace/openpi_runs/pika_umi_conversion_summary.json"),
+    include_depth: bool = False,
 ):
     with split_manifest.open() as f:
         manifest = json.load(f)
@@ -103,32 +126,23 @@ def main(
     if output_path.exists():
         shutil.rmtree(output_path)
 
+    _image_feat = {"dtype": "image", "shape": (480, 640, 3), "names": ["height", "width", "channel"]}
+    features = {
+        "left_wrist_0_rgb": _image_feat,
+        "right_wrist_0_rgb": _image_feat,
+        "state": {"dtype": "float32", "shape": (14,), "names": ["state"]},
+        "actions": {"dtype": "float32", "shape": (14,), "names": ["actions"]},
+    }
+    if include_depth:
+        # Depth pre-encoded as normalized 3-channel images (see _depth_to_image).
+        features["left_wrist_0_depth"] = _image_feat
+        features["right_wrist_0_depth"] = _image_feat
+
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         robot_type="pika_umi_dual_arm",
         fps=30,
-        features={
-            "left_wrist_0_rgb": {
-                "dtype": "image",
-                "shape": (480, 640, 3),
-                "names": ["height", "width", "channel"],
-            },
-            "right_wrist_0_rgb": {
-                "dtype": "image",
-                "shape": (480, 640, 3),
-                "names": ["height", "width", "channel"],
-            },
-            "state": {
-                "dtype": "float32",
-                "shape": (14,),
-                "names": ["state"],
-            },
-            "actions": {
-                "dtype": "float32",
-                "shape": (14,),
-                "names": ["actions"],
-            },
-        },
+        features=features,
         image_writer_threads=16,
         image_writer_processes=4,
     )
@@ -145,6 +159,9 @@ def main(
             right_grip = np.asarray(f["observations/gripper_right"], dtype=np.float64)
             left_images = f["observations/images/left_realsense_color"]
             right_images = f["observations/images/right_realsense_color"]
+            if include_depth:
+                left_depth = f["observations/images/left_realsense_depth"]
+                right_depth = f["observations/images/right_realsense_depth"]
 
             states = _state(left_pose, right_pose, left_grip, right_grip)
             actions = _actions(left_pose, right_pose, left_grip, right_grip)
@@ -153,15 +170,17 @@ def main(
                 raise ValueError(f"Action/state length mismatch in {episode_path}")
 
             for t in range(actions.shape[0]):
-                dataset.add_frame(
-                    {
-                        "left_wrist_0_rgb": _decode_jpeg(left_images[t]),
-                        "right_wrist_0_rgb": _decode_jpeg(right_images[t]),
-                        "state": states[t],
-                        "actions": actions[t],
-                        "task": PROMPT,
-                    }
-                )
+                frame = {
+                    "left_wrist_0_rgb": _decode_jpeg(left_images[t]),
+                    "right_wrist_0_rgb": _decode_jpeg(right_images[t]),
+                    "state": states[t],
+                    "actions": actions[t],
+                    "task": PROMPT,
+                }
+                if include_depth:
+                    frame["left_wrist_0_depth"] = _depth_to_image(_decode_depth(left_depth[t]))
+                    frame["right_wrist_0_depth"] = _depth_to_image(_decode_depth(right_depth[t]))
+                dataset.add_frame(frame)
             dataset.save_episode()
 
         converted.append(

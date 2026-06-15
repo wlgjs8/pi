@@ -239,7 +239,15 @@ class AugmentImages(DataTransformFn):
         out = {}
         for k, v in images.items():
             img = np.asarray(v)
-            if k in self.cfg.skip_keys or img.ndim != 3 or img.size == 0 or int(img.max()) == 0:
+            # Only augment RGB camera images. Depth-as-image (`*_depth`) and the zero
+            # base placeholder are left untouched — photometric/crop ops corrupt metric depth.
+            if (
+                not str(k).endswith("_rgb")
+                or k in self.cfg.skip_keys
+                or img.ndim != 3
+                or img.size == 0
+                or int(img.max()) == 0
+            ):
                 out[k] = v
             else:
                 out[k] = self._augment_one(img.astype(np.uint8))
