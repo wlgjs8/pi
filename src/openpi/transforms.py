@@ -249,6 +249,10 @@ class AugmentImages(DataTransformFn):
     def _augment_one(self, img: np.ndarray) -> np.ndarray:
         import cv2
 
+        # OpenCV's internal threading segfaults/deadlocks inside forked PyTorch
+        # DataLoader workers; force single-threaded, OpenCL off (idempotent, cheap).
+        cv2.setNumThreads(0)
+        cv2.ocl.setUseOpenCL(False)
         c = self.cfg
         h, w = img.shape[:2]
         if c.crop_scale_min < 1.0 and np.random.rand() < c.crop_prob:

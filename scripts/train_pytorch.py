@@ -146,6 +146,24 @@ def get_model_parameters(model):
     )
 
 
+def _prune_checkpoints(config):
+    """Mirror the JAX CheckpointManager retention (max_to_keep=1 + keep_period):
+    keep the latest checkpoint, every keep_period-th step, and the final step;
+    delete the rest. The PyTorch trainer previously kept every saved checkpoint
+    (each model.safetensors + optimizer.pt ~21G), so long runs filled the disk."""
+    root = config.checkpoint_dir
+    steps = sorted(int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit())
+    if not steps:
+        return
+    keep = {steps[-1], config.num_train_steps - 1}  # latest + final (max_to_keep=1)
+    if config.keep_period:
+        keep |= {s for s in steps if s % config.keep_period == 0}
+    for s in steps:
+        if s not in keep:
+            shutil.rmtree(root / str(s), ignore_errors=True)
+            logging.info(f"Pruned old checkpoint at step {s} (kept: latest + keep_period={config.keep_period} + final)")
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -188,6 +206,9 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         tmp_ckpt_dir.rename(final_ckpt_dir)
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+
+        # Prune old checkpoints (honor keep_period; previously kept everything -> disk full).
+        _prune_checkpoints(config)
 
         # Log checkpoint to wandb
         if config.wandb_enabled:
