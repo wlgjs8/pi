@@ -192,6 +192,30 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class CenterCropImages(DataTransformFn):
+    """Center-crop each image to (height, width) instead of aspect-preserving resize.
+
+    Gives higher effective resolution on the central object (e.g. a small bolt) than
+    resize_with_pad (which downsamples the whole 480x640 frame to fit 224), at the cost
+    of peripheral field-of-view. The downstream ResizeImages becomes a no-op when the
+    crop already matches the model resolution."""
+
+    height: int
+    width: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        out = {}
+        for k, v in data["image"].items():
+            img = np.asarray(v)
+            h, w = img.shape[:2]
+            top = max(0, (h - self.height) // 2)
+            left = max(0, (w - self.width) // 2)
+            out[k] = img[top : top + self.height, left : left + self.width]
+        data["image"] = out
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class ImageTransformConfig:
     """Weak, label-preserving image augmentation knobs (train-only).
 

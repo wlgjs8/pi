@@ -472,6 +472,9 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # converter) as extra `*_wrist_0_depth` camera inputs (RGB-D). Requires a dataset
     # converted with depth and a model whose `image_keys` include the depth keys.
     include_depth: bool = False
+    # If set, center-crop each image to (center_crop, center_crop) instead of the default
+    # aspect-preserving resize_with_pad — higher effective resolution on the central object.
+    center_crop: int | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -486,8 +489,11 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             repack_map["observation/left_wrist_0_depth"] = "left_wrist_0_depth"
             repack_map["observation/right_wrist_0_depth"] = "right_wrist_0_depth"
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
+        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth)]
+        if self.center_crop is not None:
+            data_input_transforms.append(_transforms.CenterCropImages(self.center_crop, self.center_crop))
         data_transforms = _transforms.Group(
-            inputs=[pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth)],
+            inputs=data_input_transforms,
             outputs=[pika_umi_policy.PikaUmiOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
@@ -1024,6 +1030,35 @@ _CONFIGS = [
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_openpi_rgbd",
             include_depth=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                image_aug=_transforms.ImageTransformConfig(),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # Same as pi05_pika_umi_aug (h8, relrel, RGB aug) but center-crops each image to
+    # 224x224 instead of resize_with_pad -> higher effective resolution on the central
+    # bolt. Reuses the pi05_pika_umi dataset + norm stats (state/actions unchanged).
+    TrainConfig(
+        name="pi05_pika_umi_aug_ccrop",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=8,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_openpi_train",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi"),
+            center_crop=224,
             base_config=DataConfig(
                 prompt_from_task=True,
                 image_aug=_transforms.ImageTransformConfig(),
