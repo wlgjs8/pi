@@ -1046,8 +1046,9 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     # Same as pi05_pika_umi_aug (h8, relrel, RGB aug) but center-crops each image to
-    # 224x224 instead of resize_with_pad -> higher effective resolution on the central
-    # bolt. Reuses the pi05_pika_umi dataset + norm stats (state/actions unchanged).
+    # 384x384 (cuts only ~48px top/bottom + L/R edges, keeping the lower-centre grasp
+    # region) and then resize_with_pad downsamples 384->224 -> higher effective resolution
+    # on the central bolt than full resize. Reuses the pi05_pika_umi dataset + norm stats.
     TrainConfig(
         name="pi05_pika_umi_aug_ccrop",
         model=pi0_config.Pi0Config(
@@ -1058,7 +1059,7 @@ _CONFIGS = [
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_openpi_train",
             assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi"),
-            center_crop=224,
+            center_crop=384,
             base_config=DataConfig(
                 prompt_from_task=True,
                 image_aug=_transforms.ImageTransformConfig(),
