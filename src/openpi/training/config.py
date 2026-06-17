@@ -1075,6 +1075,34 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # Speed/IO test: same model+relrel as pi05_pika_umi, but reads a VIDEO-backed dataset
+    # (MP4 per episode/camera) hosted on the NFS storage server (HF_LEROBOT_HOME=/mnt/pika/lerobot,
+    # repo_id plaif/pika_umi_video_test). num_workers bumped 2->12 to hide NFS read latency behind
+    # compute. Used to compare data-loading throughput vs the local PNG-in-parquet (image-backed)
+    # dataset. Run compute_norm_stats with the same HF_LEROBOT_HOME first.
+    TrainConfig(
+        name="pi05_pika_umi_video_test",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=8,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_test",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_test"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #

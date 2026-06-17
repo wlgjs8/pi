@@ -143,6 +143,10 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        # Force the PyAV decoder for video-backed datasets: the pip torchcodec build's native ops
+        # fail to register against our custom torch 2.8.0+cu128 (Blackwell) wheel. PyAV decodes our
+        # AV1/H.264 MP4s fine and is a no-op for image-backed datasets.
+        video_backend="pyav",
     )
 
     if data_config.prompt_from_task:
