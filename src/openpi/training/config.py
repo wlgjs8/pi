@@ -1129,6 +1129,32 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # Baseline redo on the full 429-episode storage dataset, 8:2 episode-level random split,
+    # pretrained pi05_base, 40k, no-aug. Train = plaif/pika_umi_video_train_8020 (video/h264, NFS),
+    # val = plaif/pika_umi_video_val_8020 (eval separately). HF_LEROBOT_HOME=/mnt/pika/lerobot.
+    TrainConfig(
+        name="pi05_pika_umi_video_8020",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=8,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_8020",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_8020"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
