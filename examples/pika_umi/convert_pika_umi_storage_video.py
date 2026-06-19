@@ -108,33 +108,11 @@ def _find_episodes(data_root: pathlib.Path) -> list[pathlib.Path]:
     return eps
 
 
-def main(
-    data_root: pathlib.Path = pathlib.Path("/mnt/pika/bolt/data"),
-    root: pathlib.Path = pathlib.Path("/mnt/pika/lerobot/plaif/pika_umi_video_test"),
-    repo_id: str = REPO_ID,
-    vcodec: str = "h264",
-    limit: int | None = None,
-):
-    import functools
+def _make_dataset(repo_id: str, root: pathlib.Path):
     import shutil
-
-    # LeRobot 0.1.0's encode_episode_videos() calls encode_video_frames() WITHOUT a vcodec arg, so
-    # it always uses the libsvtav1 default. Monkeypatch the name in the dataset module to pin our
-    # codec (h264 = much faster encode + decode than AV1; the create(video_backend=...) arg only
-    # controls the *decode* backend, not the encoder).
-    import lerobot.common.datasets.lerobot_dataset as _lrd
-    from lerobot.common.datasets.video_utils import encode_video_frames as _enc
-
-    _lrd.encode_video_frames = functools.partial(_enc, vcodec=vcodec)
 
     if root.exists():
         shutil.rmtree(root)
-
-    episodes = _find_episodes(data_root)
-    if limit is not None:
-        episodes = episodes[:limit]
-    print(f"found {len(episodes)} episodes under {data_root}")
-
     _img_feat = {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]}
     features = {
         "left_wrist_0_rgb": _img_feat,
@@ -142,8 +120,7 @@ def main(
         "state": {"dtype": "float32", "shape": (14,), "names": ["state"]},
         "actions": {"dtype": "float32", "shape": (14,), "names": ["actions"]},
     }
-
-    dataset = LeRobotDataset.create(
+    return LeRobotDataset.create(
         repo_id=repo_id,
         root=root,
         robot_type="pika_umi_dual_arm",
@@ -155,58 +132,105 @@ def main(
         image_writer_processes=4,
     )
 
-    total_frames = 0
-    converted = 0
+
+def _episode_frames(ep: pathlib.Path):
+    """Read one episode -> list of LeRobot frames. Raises on incomplete/bad data (caller skips)."""
+    with h5py.File(ep, "r") as f:
+        L, R = f["observations/left"], f["observations/right"]
+        lp = np.asarray(L["pose"], dtype=np.float64)
+        rp = np.asarray(R["pose"], dtype=np.float64)
+        bad_ratio = max(_bad_pose_mask(lp).mean(), _bad_pose_mask(rp).mean())
+        if bad_ratio > 0.10:
+            raise ValueError(f"tracking dropout: {bad_ratio:.0%} bad pose frames")
+        left_pose = _sanitize_pose(lp)
+        right_pose = _sanitize_pose(rp)
+        left_grip = np.nan_to_num(np.asarray(L["gripper"], dtype=np.float64)[:, 0])
+        right_grip = np.nan_to_num(np.asarray(R["gripper"], dtype=np.float64)[:, 0])
+        left_images = L["images/realsense_color"]
+        right_images = R["images/realsense_color"]
+
+        states = _state(left_pose, right_pose, left_grip, right_grip)
+        actions = _actions(left_pose, right_pose, left_grip, right_grip)
+        if actions.shape[0] != states.shape[0] - 1:
+            raise ValueError("length mismatch")
+        return [
+            {
+                "left_wrist_0_rgb": _decode_color(left_images[t]),
+                "right_wrist_0_rgb": _decode_color(right_images[t]),
+                "state": states[t],
+                "actions": actions[t],
+                "task": PROMPT,
+            }
+            for t in range(actions.shape[0])
+        ]
+
+
+def main(
+    data_root: pathlib.Path = pathlib.Path("/mnt/pika/bolt/data"),
+    lerobot_home: pathlib.Path = pathlib.Path("/mnt/pika/lerobot"),
+    train_repo_id: str = "plaif/pika_umi_video_train",
+    val_repo_id: str = "plaif/pika_umi_video_val",
+    val_frac: float = 0.1,
+    seed: int = 0,
+    vcodec: str = "h264",
+    limit: int | None = None,
+    split_record: pathlib.Path = pathlib.Path("/mnt/pika/lerobot/pika_umi_video_split.json"),
+):
+    import functools
+    import json
+
+    # LeRobot 0.1.0's encode_episode_videos() calls encode_video_frames() WITHOUT a vcodec arg, so
+    # it always uses the libsvtav1 default. Monkeypatch the name in the dataset module to pin our
+    # codec (h264 = much faster encode + decode than AV1; the create(video_backend=...) arg only
+    # controls the *decode* backend, not the encoder).
+    import lerobot.common.datasets.lerobot_dataset as _lrd
+    from lerobot.common.datasets.video_utils import encode_video_frames as _enc
+
+    _lrd.encode_video_frames = functools.partial(_enc, vcodec=vcodec)
+
+    episodes = _find_episodes(data_root)
+    if limit is not None:
+        episodes = episodes[:limit]
+
+    # Deterministic episode-level split: whole episodes go to val (no within-episode frame leakage).
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(episodes))
+    n_val = max(1, round(val_frac * len(episodes)))
+    val_idx = set(order[:n_val].tolist())
+    print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val")
+
+    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id)
+    val_ds = _make_dataset(val_repo_id, lerobot_home / val_repo_id)
+
+    counts = {"train": [0, 0], "val": [0, 0]}  # [episodes, frames]
     skipped = []
+    split_log = {"train": [], "val": []}
     for i, ep in enumerate(episodes):
+        which = "val" if i in val_idx else "train"
         try:
-            with h5py.File(ep, "r") as f:
-                L, R = f["observations/left"], f["observations/right"]
-                lp = np.asarray(L["pose"], dtype=np.float64)
-                rp = np.asarray(R["pose"], dtype=np.float64)
-                bad_ratio = max(_bad_pose_mask(lp).mean(), _bad_pose_mask(rp).mean())
-                if bad_ratio > 0.10:
-                    raise ValueError(f"tracking dropout: {bad_ratio:.0%} bad pose frames")
-                left_pose = _sanitize_pose(lp)
-                right_pose = _sanitize_pose(rp)
-                left_grip = np.nan_to_num(np.asarray(L["gripper"], dtype=np.float64)[:, 0])
-                right_grip = np.nan_to_num(np.asarray(R["gripper"], dtype=np.float64)[:, 0])
-                left_images = L["images/realsense_color"]
-                right_images = R["images/realsense_color"]
-
-                states = _state(left_pose, right_pose, left_grip, right_grip)
-                actions = _actions(left_pose, right_pose, left_grip, right_grip)
-                if actions.shape[0] != states.shape[0] - 1:
-                    raise ValueError("length mismatch")
-
-                frames = []
-                for t in range(actions.shape[0]):
-                    frames.append(
-                        {
-                            "left_wrist_0_rgb": _decode_color(left_images[t]),
-                            "right_wrist_0_rgb": _decode_color(right_images[t]),
-                            "state": states[t],
-                            "actions": actions[t],
-                            "task": PROMPT,
-                        }
-                    )
+            frames = _episode_frames(ep)
         except Exception as e:  # incomplete/locked file (concurrent collection) or bad data
             skipped.append((str(ep), repr(e)))
-            print(f"[{i + 1}/{len(episodes)}] SKIP {ep.parent.name}/{ep.name}: {e}")
+            print(f"[{i + 1}/{len(episodes)}] SKIP({which}) {ep.parent.name}/{ep.name}: {e}")
             continue
-
+        ds = val_ds if which == "val" else train_ds
         for fr in frames:
-            dataset.add_frame(fr)
-        dataset.save_episode()
-        converted += 1
-        total_frames += len(frames)
-        print(f"[{i + 1}/{len(episodes)}] {ep.parent.name}/{ep.name}: {len(frames)} frames")
+            ds.add_frame(fr)
+        ds.save_episode()
+        counts[which][0] += 1
+        counts[which][1] += len(frames)
+        split_log[which].append(f"{ep.parent.name}/{ep.name}")
+        print(f"[{i + 1}/{len(episodes)}] {which} {ep.parent.name}/{ep.name}: {len(frames)} frames")
 
-    print(f"DONE: converted {converted}/{len(episodes)} episodes, {total_frames} frames -> {root}")
+    split_record.parent.mkdir(parents=True, exist_ok=True)
+    split_record.write_text(json.dumps({"seed": seed, "val_frac": val_frac, **split_log}, indent=2))
+    print(
+        f"DONE: train {counts['train'][0]}ep/{counts['train'][1]}fr, "
+        f"val {counts['val'][0]}ep/{counts['val'][1]}fr; skipped {len(skipped)}; split -> {split_record}"
+    )
     if skipped:
-        print(f"SKIPPED {len(skipped)}:")
         for s, e in skipped:
-            print("  ", s, e)
+            print("  SKIP", s, e)
 
 
 if __name__ == "__main__":
