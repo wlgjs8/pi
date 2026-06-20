@@ -1155,6 +1155,35 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # Same as pi05_pika_umi_video_8020 but on the TOOL/TCP-frame dataset: the converter now applies
+    # the tracker->robot-TCP tip offset (inv(T_tcp_umi_gripper), umi_retarget_eelocal.yaml) before the
+    # ee_local math, so actions/proprio are at the robot TCP, not the raw Vive tracker. SAME episode
+    # split as _8020 (seed=0, val_frac=0.2 -> 343/86) for an apples-to-apples tracker-vs-tcp comparison.
+    # Train = plaif/pika_umi_video_train_tcp_8020, val = plaif/pika_umi_video_val_tcp_8020 (eval separately).
+    # NOTE: recompute norm stats for this repo_id before training. HF_LEROBOT_HOME=/mnt/pika/lerobot.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_8020",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=8,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_8020",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
