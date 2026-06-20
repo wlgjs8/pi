@@ -110,6 +110,8 @@ def main() -> None:
 
     sq_first, n_first = 0.0, 0.0
     sq_chunk, n_chunk = 0.0, 0.0
+    chunk_pos_sq = [0.0] * HORIZON  # normalized action MSE per chunk position (step 0..H-1)
+    chunk_pos_n = [0] * HORIZON
     phase_sq = {p: 0.0 for p in phase_mod.PHASE_NAMES}
     phase_n = {p: 0.0 for p in phase_mod.PHASE_NAMES}
     GRASP = {"right": (7, 8, 9, "b1"), "left": (0, 1, 2, "b3")}
@@ -157,6 +159,8 @@ def main() -> None:
             target = gt[t : t + h]
             err2 = (pred[:h] - target) ** 2
             sq_chunk += float(err2.sum()); n_chunk += err2.size
+            for k in range(h):
+                chunk_pos_sq[k] += float(err2[k].sum()); chunk_pos_n[k] += err2[k].size
             first = err2[0]
             sq_first += float(first.sum()); n_first += first.size
             phase = bounds.phase_for_frame(t)
@@ -234,6 +238,14 @@ def main() -> None:
             "action_mse": sq_chunk / max(n_chunk, 1.0),
             "normalized_action_mse": (sq_chunk / max(n_chunk, 1.0)) / scale,
         },
+        "chunk_by_position_normalized": [
+            (chunk_pos_sq[k] / max(chunk_pos_n[k], 1.0)) / scale for k in range(HORIZON)
+        ],
+        "chunk_by_position_note": (
+            "normalized action MSE at each predicted chunk step 0..H-1 (step 0 == first_step); "
+            "evaluated over all stride frames of every val episode; rising across positions = "
+            "the chunk degrades further into the horizon"
+        ),
         "first_step_by_phase_normalized": {
             p: (phase_sq[p] / max(phase_n[p], 1.0)) / scale for p in phase_mod.PHASE_NAMES
         },
