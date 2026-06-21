@@ -59,6 +59,13 @@ class Args:
     # reduces per-step mode-switching for multimodal tasks (e.g. the bolt pile). Costs N× inference.
     num_medoid_samples: int = 1
 
+    # torch.compile mode for SERVING (overrides the checkpoint config's model.pytorch_compile_mode).
+    # Training configs default to 'max-autotune', which compiles extremely slowly (minutes-to-hours,
+    # + recompiles on shape changes) → deploy stutter. For serving, 'default' (fast compile) or 'off'
+    # (eager, no compile) is far better. Allowed: default | reduce-overhead | max-autotune |
+    # max-autotune-no-cudagraphs | off (eager) | config (keep the checkpoint's setting).
+    compile_mode: str = "default"
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -81,11 +88,22 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def _config_with_compile_mode(config_name: str, compile_mode: str):
+    """Load a config, overriding model.pytorch_compile_mode for serving (training unaffected)."""
+    cfg = _config.get_config(config_name)
+    if compile_mode == "config":
+        return cfg
+    mode = None if compile_mode in ("off", "none", "eager", "disable") else compile_mode
+    return dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, pytorch_compile_mode=mode))
+
+
+def create_default_policy(
+    env: EnvMode, *, default_prompt: str | None = None, compile_mode: str = "default"
+) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config_with_compile_mode(checkpoint.config, compile_mode), checkpoint.dir, default_prompt=default_prompt
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -95,13 +113,18 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config_with_compile_mode(args.policy.config, args.compile_mode),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(
+                args.env, default_prompt=args.default_prompt, compile_mode=args.compile_mode
+            )
 
 
 def main(args: Args) -> None:
+    logging.info("Serving with compile_mode=%s, num_medoid_samples=%d", args.compile_mode, args.num_medoid_samples)
     policy = create_policy(args)
     if args.num_medoid_samples > 1:
         logging.info("Wrapping policy in MedoidPolicy (num_samples=%d): consensus selection at inference",
