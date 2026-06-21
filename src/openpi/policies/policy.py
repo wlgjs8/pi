@@ -133,3 +133,33 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+
+class MedoidPolicy(_base_policy.BasePolicy):
+    """Sample N action chunks per `infer` and return the MEDOID — the draw most central among the
+    N (min summed L2 over the flattened chunk). A deployable consensus selector (no GT, no value
+    function) that commits to the dominant mode, reducing the per-step mode-switching / indecision
+    a single stochastic draw causes in a multimodal flow policy (a different valid mode each step →
+    the gripper oscillates between targets and never commits). Diagnostic 1 (robotics-lab-pickplace-eval)
+    found the medoid recovers ~45-51% of the mean→oracle best-of-N gap. `num_samples=1` is a no-op
+    (plain single-draw behavior).
+    """
+
+    def __init__(self, policy: _base_policy.BasePolicy, num_samples: int = 8):
+        self._policy = policy
+        self._n = max(1, int(num_samples))
+
+    @override
+    def infer(self, obs: dict, **kwargs) -> dict:  # type: ignore[misc]
+        if self._n == 1:
+            return self._policy.infer(obs, **kwargs)
+        results = [self._policy.infer(obs, **kwargs) for _ in range(self._n)]
+        chunks = [np.asarray(r["actions"], dtype=np.float64) for r in results]
+        flat = np.stack([c.reshape(-1) for c in chunks])  # (N, H*A)
+        dist = np.linalg.norm(flat[:, None, :] - flat[None, :, :], axis=2).sum(axis=1)  # (N,)
+        idx = int(dist.argmin())
+        return results[idx]
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return getattr(self._policy, "metadata", {})

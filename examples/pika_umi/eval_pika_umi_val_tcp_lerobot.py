@@ -80,6 +80,9 @@ def main() -> None:
     parser.add_argument("--lerobot-home", type=str, default=str(LEROBOT_HOME))
     parser.add_argument("--tag", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None, help="limit number of val episodes (debug)")
+    parser.add_argument("--n-select", type=int, default=1,
+                        help="if >1, wrap in MedoidPolicy: sample N chunks/frame and use the consensus "
+                             "(medoid) chunk for all metrics — measures performance WITH best-of-N selection")
     args = parser.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -107,6 +110,10 @@ def main() -> None:
     scale = float(np.mean(np.square(np.maximum(action_std, 1e-12))))
 
     policy = _policy_config.create_trained_policy(_config.get_config(args.config), str(ckpt_dir))
+    if args.n_select > 1:
+        from openpi.policies.policy import MedoidPolicy
+        policy = MedoidPolicy(policy, num_samples=args.n_select)
+        print(f"selection: medoid-of-{args.n_select} (consensus best-of-N) — all metrics use the selected chunk")
 
     sq_first, n_first = 0.0, 0.0
     sq_chunk, n_chunk = 0.0, 0.0
@@ -222,6 +229,8 @@ def main() -> None:
         "config": args.config,
         "ckpt_base": args.ckpt_base,
         "val_repo_id": args.val_repo_id,
+        "n_select": args.n_select,
+        "selection": ("single_draw" if args.n_select <= 1 else f"medoid_of_{args.n_select}"),
         "stride": args.stride,
         "horizon": HORIZON,
         "episodes": n_ep,

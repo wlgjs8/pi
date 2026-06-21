@@ -54,6 +54,11 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # If > 1, wrap the policy so each inference samples N action chunks and returns the MEDOID
+    # (consensus) chunk — a deployable best-of-N selector that commits to the dominant mode and
+    # reduces per-step mode-switching for multimodal tasks (e.g. the bolt pile). Costs N× inference.
+    num_medoid_samples: int = 1
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -98,6 +103,10 @@ def create_policy(args: Args) -> _policy.Policy:
 
 def main(args: Args) -> None:
     policy = create_policy(args)
+    if args.num_medoid_samples > 1:
+        logging.info("Wrapping policy in MedoidPolicy (num_samples=%d): consensus selection at inference",
+                     args.num_medoid_samples)
+        policy = _policy.MedoidPolicy(policy, num_samples=args.num_medoid_samples)
     policy_metadata = policy.metadata
 
     # Record the policy's behavior.
