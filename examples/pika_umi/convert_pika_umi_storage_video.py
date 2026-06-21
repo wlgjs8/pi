@@ -96,19 +96,28 @@ def _state(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
     ).astype(np.float32)
 
 
-def _arm_actions(pose, grip) -> np.ndarray:
+def _arm_actions(pose, grip, gripper_absolute: bool = False) -> np.ndarray:
     cur = Rotation.from_quat(pose[:-1, 3:7])
     nxt = Rotation.from_quat(pose[1:, 3:7])
     pos_delta_world = pose[1:, :3] - pose[:-1, :3]
     pos_delta_local = cur.inv().apply(pos_delta_world)
     rot_delta = (cur.inv() * nxt).as_rotvec()
-    grip_delta = ((grip[1:] - grip[:-1]) / 100.0)[:, None]
-    return np.concatenate([pos_delta_local, rot_delta, grip_delta], axis=1).astype(np.float32)
+    if gripper_absolute:
+        # ABSOLUTE gripper target (next-step open %, /100). The bolt-grasp target (~bolt size) and the
+        # release target (~open) are CONSISTENT across episodes regardless of the start-open amount,
+        # whereas the delta (target-current) is multimodal (100->10 = -90 vs 50->10 = -40) -> the model
+        # under-closes. Absolute makes the grasp/release targets unimodal. Requires the DEPLOY to command
+        # the gripper to this absolute target (not integrate a delta).
+        grip_act = (grip[1:] / 100.0)[:, None]
+    else:
+        grip_act = ((grip[1:] - grip[:-1]) / 100.0)[:, None]  # per-step delta
+    return np.concatenate([pos_delta_local, rot_delta, grip_act], axis=1).astype(np.float32)
 
 
-def _actions(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
+def _actions(left_pose, right_pose, left_grip, right_grip, gripper_absolute: bool = False) -> np.ndarray:
     return np.concatenate(
-        [_arm_actions(left_pose, left_grip), _arm_actions(right_pose, right_grip)], axis=1
+        [_arm_actions(left_pose, left_grip, gripper_absolute),
+         _arm_actions(right_pose, right_grip, gripper_absolute)], axis=1
     ).astype(np.float32)
 
 
@@ -176,7 +185,8 @@ def _make_dataset(repo_id: str, root: pathlib.Path):
     )
 
 
-def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s: float, min_seg_frames: int):
+def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s: float, min_seg_frames: int,
+                    gripper_absolute: bool = False):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
     Some episodes were collected before the 30 Hz pipeline was stabilized and carry multi-second
@@ -208,7 +218,7 @@ def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s:
         right_images = R["images/realsense_color"]
 
         states = _state(left_pose, right_pose, left_grip, right_grip)
-        actions = _actions(left_pose, right_pose, left_grip, right_grip)
+        actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_absolute)
         if actions.shape[0] != states.shape[0] - 1:
             raise ValueError("length mismatch")
         n_act = actions.shape[0]  # writable frames 0..n_act-1; action[t] spans ts[t]->ts[t+1]
@@ -265,6 +275,7 @@ def main(
     ),
     gap_threshold_s: float = 0.1,
     min_seg_frames: int = 16,
+    gripper_mode: str = "delta",  # "delta" (per-step change) or "absolute" (next-step target %)
 ):
     import functools
     import json
@@ -285,6 +296,8 @@ def main(
     else:
         print("pose frame: raw tracker (steamvr_world, NO tool offset) -- legacy *_8020 behavior")
     print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
+    gripper_absolute = gripper_mode == "absolute"
+    print(f"gripper action: {'ABSOLUTE next-step target %' if gripper_absolute else 'per-step DELTA'} (mode={gripper_mode})")
 
     episodes = _find_episodes(data_root)
     # Drop episodes already used in a prior split (build a fresh/unseen test set from new collection).
@@ -315,7 +328,7 @@ def main(
     for i, ep in enumerate(episodes):
         which = "val" if i in val_idx else "train"
         try:
-            segments, n_writable = _episode_frames(ep, tool_offset, gap_threshold_s, min_seg_frames)
+            segments, n_writable = _episode_frames(ep, tool_offset, gap_threshold_s, min_seg_frames, gripper_absolute)
         except Exception as e:  # incomplete/locked file (concurrent collection) or bad data
             skipped.append((str(ep), repr(e)))
             print(f"[{i + 1}/{len(episodes)}] SKIP({which}) {ep.parent.name}/{ep.name}: {e}")
@@ -351,6 +364,7 @@ def main(
                 "retarget_config": str(retarget_config) if tool_offset is not None else None,
                 "gap_threshold_s": gap_threshold_s,
                 "min_seg_frames": min_seg_frames,
+                "gripper_mode": gripper_mode,
                 "dropped_frames_gap_stub": dropped_frames,
                 "source_episodes_with_gaps": n_src_with_gaps,
                 **split_log,
