@@ -1184,6 +1184,35 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # Longer action horizon (24) on the SAME tcp dataset (no re-conversion: action_horizon is a model
+    # param; openpi chunks the per-frame actions at load time). Motivated by real rollout: executing a
+    # longer chunk (chunk-execute-steps) is much more accurate because it commits to ONE sampled mode
+    # for longer instead of re-sampling a different mode (a different bolt) each replan -> averaging to
+    # the pile center. chunk-execute is a deploy knob (<= horizon), so train the longer horizon and pick
+    # execute at deploy via the per-chunk-position MSE. Only 3 segs (0.1% frames) are < 25 frames.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_8020_h24",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_8020",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
