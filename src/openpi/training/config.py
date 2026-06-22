@@ -1243,6 +1243,34 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # BINARY gripper (open/closed @th25) + tail-pad 50 + action_horizon 50 + MORE DATA (458 handheld train,
+    # val pinned to the gripabs 86 via --val-from-record). Binary strips the task-irrelevant open-angle noise
+    # (~40-95 random) AND the under-close: deploy commands 0 -> firm close (bolt blocks at its width) / 1 ->
+    # open, through the EXISTING absolute gripper path (no deploy change). tail-pad fixes the rare/truncated
+    # left_open terminal label (verified to improve left release). horizon 50 (openpi default) = more
+    # closed-loop commitment (validated: deploy chunk-execute 24 ≫ 8). proprio gripper stays ABSOLUTE.
+    # Datasets: train plaif/pika_umi_video_train_tcp_binary_h50; eval reuses plaif/pika_umi_video_val_tcp_gripabs_8020
+    # (pose-only comparable; run eval --gripper-mode absolute, binary preds 0/1 -> 0/100%). See
+    # [[robotics-lab-pickplace-eval]], [[vla-rollout-diagnosis]].
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_binary_h50",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #

@@ -96,28 +96,32 @@ def _state(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
     ).astype(np.float32)
 
 
-def _arm_actions(pose, grip, gripper_absolute: bool = False) -> np.ndarray:
+def _arm_actions(pose, grip, gripper_mode: str = "delta", binary_th: float = 25.0) -> np.ndarray:
     cur = Rotation.from_quat(pose[:-1, 3:7])
     nxt = Rotation.from_quat(pose[1:, 3:7])
     pos_delta_world = pose[1:, :3] - pose[:-1, :3]
     pos_delta_local = cur.inv().apply(pos_delta_world)
     rot_delta = (cur.inv() * nxt).as_rotvec()
-    if gripper_absolute:
-        # ABSOLUTE gripper target (next-step open %, /100). The bolt-grasp target (~bolt size) and the
-        # release target (~open) are CONSISTENT across episodes regardless of the start-open amount,
-        # whereas the delta (target-current) is multimodal (100->10 = -90 vs 50->10 = -40) -> the model
-        # under-closes. Absolute makes the grasp/release targets unimodal. Requires the DEPLOY to command
-        # the gripper to this absolute target (not integrate a delta).
-        grip_act = (grip[1:] / 100.0)[:, None]
-    else:
-        grip_act = ((grip[1:] - grip[:-1]) / 100.0)[:, None]  # per-step delta
+    g = grip[1:]
+    if gripper_mode == "binary":
+        # 1 = OPEN (>= th), 0 = CLOSED/grip (< th). The exact open angle (random ~40-95) AND the exact
+        # grasp angle are task-irrelevant for uniform rigid bolts -> binarizing strips that noise (which
+        # otherwise drives mode-averaging + under-close). Deploy commands 0 -> firm close (bolt blocks at
+        # its width) / 1 -> open; maps cleanly through the existing absolute gripper path (no deploy change).
+        grip_act = (g >= binary_th).astype(np.float64)[:, None]
+    elif gripper_mode == "absolute":
+        # ABSOLUTE gripper target (next-step open %, /100). Consistent grasp/release targets vs the
+        # multimodal delta (100->10 = -90 vs 50->10 = -40 -> under-close). Deploy commands this target.
+        grip_act = (g / 100.0)[:, None]
+    else:  # delta
+        grip_act = ((g - grip[:-1]) / 100.0)[:, None]  # per-step delta
     return np.concatenate([pos_delta_local, rot_delta, grip_act], axis=1).astype(np.float32)
 
 
-def _actions(left_pose, right_pose, left_grip, right_grip, gripper_absolute: bool = False) -> np.ndarray:
+def _actions(left_pose, right_pose, left_grip, right_grip, gripper_mode: str = "delta", binary_th: float = 25.0) -> np.ndarray:
     return np.concatenate(
-        [_arm_actions(left_pose, left_grip, gripper_absolute),
-         _arm_actions(right_pose, right_grip, gripper_absolute)], axis=1
+        [_arm_actions(left_pose, left_grip, gripper_mode, binary_th),
+         _arm_actions(right_pose, right_grip, gripper_mode, binary_th)], axis=1
     ).astype(np.float32)
 
 
@@ -186,7 +190,7 @@ def _make_dataset(repo_id: str, root: pathlib.Path):
 
 
 def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s: float, min_seg_frames: int,
-                    gripper_absolute: bool = False):
+                    gripper_mode: str = "delta", binary_th: float = 25.0, tail_pad_frames: int = 0):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
     Some episodes were collected before the 30 Hz pipeline was stabilized and carry multi-second
@@ -218,7 +222,7 @@ def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s:
         right_images = R["images/realsense_color"]
 
         states = _state(left_pose, right_pose, left_grip, right_grip)
-        actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_absolute)
+        actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_mode, binary_th)
         if actions.shape[0] != states.shape[0] - 1:
             raise ValueError("length mismatch")
         n_act = actions.shape[0]  # writable frames 0..n_act-1; action[t] spans ts[t]->ts[t+1]
@@ -256,6 +260,32 @@ def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s:
             ]
             for seg in segments
         ]
+        # Tail-pad: the LAST action of an episode (left release / left_open) is followed by only a few
+        # frames before collection stops, so the "fully open + held" state is rare and the terminal
+        # action-chunk is truncated/padded -> weak left_open (verified: +pad markedly improves it; matters
+        # MORE at long horizon, where end-of-episode chunks need ~H frames). Append N static frames at the
+        # final pose: zero pose-delta, gripper held at its final value (binary: open=1). Only the segment
+        # that reaches the episode end (last writable frame) is padded.
+        if tail_pad_frames > 0 and out and segments and segments[-1] and segments[-1][-1] == n_act - 1:
+            gl, gr = float(left_grip[-1]), float(right_grip[-1])
+            if gripper_mode == "binary":
+                hold_l, hold_r = float(gl >= binary_th), float(gr >= binary_th)
+            elif gripper_mode == "absolute":
+                hold_l, hold_r = gl / 100.0, gr / 100.0
+            else:  # delta -> no further change
+                hold_l, hold_r = 0.0, 0.0
+            stay = np.array([0, 0, 0, 0, 0, 0, hold_l, 0, 0, 0, 0, 0, 0, hold_r], dtype=np.float32)
+            final_state = states[-1].astype(np.float32)  # post-release pose, gripper absolute (open)
+            img_l = _decode_color(left_images[-1])
+            img_r = _decode_color(right_images[-1])
+            for _ in range(tail_pad_frames):
+                out[-1].append({
+                    "left_wrist_0_rgb": img_l.copy(),
+                    "right_wrist_0_rgb": img_r.copy(),
+                    "state": final_state.copy(),
+                    "actions": stay.copy(),
+                    "task": PROMPT,
+                })
         return out, n_act
 
 
@@ -270,12 +300,20 @@ def main(
     limit: int | None = None,
     split_record: pathlib.Path = pathlib.Path("/mnt/pika/lerobot/pika_umi_video_split.json"),
     exclude_record: pathlib.Path | None = None,
+    # Pin val to a prior split's `val` list: those episodes are SKIPPED here (reuse the existing
+    # val dataset untouched), and ALL other found episodes (incl. newly collected ones) go to TRAIN.
+    # Guarantees the val set stays byte-identical for apples-to-apples eval while train grows.
+    val_from_record: pathlib.Path | None = None,
     retarget_config: pathlib.Path | None = pathlib.Path(
         "/home/plaif/workspace/robotics_lab/calibration/umi_retarget_eelocal.yaml"
     ),
     gap_threshold_s: float = 0.1,
     min_seg_frames: int = 16,
-    gripper_mode: str = "delta",  # "delta" (per-step change) or "absolute" (next-step target %)
+    gripper_mode: str = "delta",  # "delta" (per-step change) | "absolute" (next-step %) | "binary" (open/closed)
+    gripper_binary_th: float = 25.0,  # for gripper_mode=binary: opening >= th -> 1 (open), else 0 (closed/grip)
+    tail_pad_frames: int = 0,  # append N static (final-pose, gripper-held) frames to the episode-end segment
+    exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot": a
+                                             # different embodiment/frame that must NOT mix into a handheld run)
 ):
     import functools
     import json
@@ -296,10 +334,17 @@ def main(
     else:
         print("pose frame: raw tracker (steamvr_world, NO tool offset) -- legacy *_8020 behavior")
     print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
-    gripper_absolute = gripper_mode == "absolute"
-    print(f"gripper action: {'ABSOLUTE next-step target %' if gripper_absolute else 'per-step DELTA'} (mode={gripper_mode})")
+    _grip_desc = {"binary": f"BINARY open/closed (>=th{gripper_binary_th:g} -> 1 open, else 0 grip)",
+                  "absolute": "ABSOLUTE next-step target %", "delta": "per-step DELTA"}.get(gripper_mode, gripper_mode)
+    print(f"gripper action: {_grip_desc} (mode={gripper_mode})")
+    if tail_pad_frames > 0:
+        print(f"tail-pad: +{tail_pad_frames} static frames at the episode-end segment (final pose, gripper held)")
 
     episodes = _find_episodes(data_root)
+    if exclude_path_substr:
+        n0 = len(episodes)
+        episodes = [e for e in episodes if exclude_path_substr not in str(e)]
+        print(f"excluded {n0 - len(episodes)} episodes matching path substr {exclude_path_substr!r} -> {len(episodes)} remain")
     # Drop episodes already used in a prior split (build a fresh/unseen test set from new collection).
     if exclude_record is not None:
         ex = json.loads(pathlib.Path(exclude_record).read_text())
@@ -311,11 +356,28 @@ def main(
 
     # Deterministic episode-level split: whole episodes go to val (no within-episode frame leakage).
     # val_frac<=0 -> single dataset (everything to train_repo_id), e.g. for a fresh test set.
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(episodes))
-    n_val = max(1, round(val_frac * len(episodes))) if val_frac > 0 else 0
-    val_idx = set(order[:n_val].tolist())
-    print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val")
+    if val_from_record is not None:
+        rec = json.loads(pathlib.Path(val_from_record).read_text())
+        valset = set(rec.get("val", []))
+        keys = [f"{e.parent.name}/{e.name}" for e in episodes]
+        missing = valset - set(keys)
+        if missing:
+            raise SystemExit(
+                f"--val-from-record: {len(missing)} pinned val episodes not found in data_root "
+                f"(cannot keep val identical): {sorted(missing)[:5]}"
+            )
+        val_idx = {i for i, k in enumerate(keys) if k in valset}
+        n_val = 0  # val_ds stays None -> val episodes are SKIPPED (reuse the existing val dataset)
+        print(
+            f"found {len(episodes)} episodes; --val-from-record pins {len(val_idx)} val (SKIPPED, "
+            f"reuse existing dataset) -> {len(episodes) - len(val_idx)} to TRAIN"
+        )
+    else:
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(len(episodes))
+        n_val = max(1, round(val_frac * len(episodes))) if val_frac > 0 else 0
+        val_idx = set(order[:n_val].tolist())
+        print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val")
 
     train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id)
     val_ds = _make_dataset(val_repo_id, lerobot_home / val_repo_id) if n_val > 0 else None
@@ -327,8 +389,11 @@ def main(
     n_src_with_gaps = 0  # source episodes that produced >1 segment or lost frames
     for i, ep in enumerate(episodes):
         which = "val" if i in val_idx else "train"
+        if which == "val" and val_ds is None:
+            continue  # val pinned via --val-from-record: skip rebuild, reuse the existing val dataset
         try:
-            segments, n_writable = _episode_frames(ep, tool_offset, gap_threshold_s, min_seg_frames, gripper_absolute)
+            segments, n_writable = _episode_frames(ep, tool_offset, gap_threshold_s, min_seg_frames,
+                                                    gripper_mode, gripper_binary_th, tail_pad_frames)
         except Exception as e:  # incomplete/locked file (concurrent collection) or bad data
             skipped.append((str(ep), repr(e)))
             print(f"[{i + 1}/{len(episodes)}] SKIP({which}) {ep.parent.name}/{ep.name}: {e}")
@@ -365,6 +430,8 @@ def main(
                 "gap_threshold_s": gap_threshold_s,
                 "min_seg_frames": min_seg_frames,
                 "gripper_mode": gripper_mode,
+                "gripper_binary_th": gripper_binary_th,
+                "tail_pad_frames": tail_pad_frames,
                 "dropped_frames_gap_stub": dropped_frames,
                 "source_episodes_with_gaps": n_src_with_gaps,
                 **split_log,
