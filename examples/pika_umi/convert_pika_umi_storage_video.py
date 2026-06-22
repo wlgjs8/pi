@@ -69,6 +69,26 @@ def _crop_shape(frac: float | None, base=(480, 640)) -> tuple[int, int, int]:
     return (int(round(h * frac)), int(round(w * frac)), 3)
 
 
+def _make_hold_frame(last_frame: dict, gripper_action: str) -> dict:
+    """A frozen 'hold' frame: last image + state held, action = stay-put (zero pose delta; gripper stays
+    at its current opening). Appended to an episode's FINAL segment to extend the short post-release tail
+    (see the tail-pad rationale at the write loop). State layout is 14-D
+    [L pos3, L rot3, L grip(6), R pos3, R rot3, R grip(13)]; action shares the layout."""
+    hold = np.zeros(14, dtype=np.float32)
+    if gripper_action == "absolute":
+        # absolute action gripper = next-step opening; holding means keep the current (open) opening
+        hold[6] = last_frame["state"][6]
+        hold[13] = last_frame["state"][13]
+    # delta mode: zero gripper delta == hold (leave hold[6]/[13] at 0)
+    return {
+        "left_wrist_0_rgb": last_frame["left_wrist_0_rgb"],
+        "right_wrist_0_rgb": last_frame["right_wrist_0_rgb"],
+        "state": last_frame["state"],
+        "actions": hold,
+        "task": PROMPT,
+    }
+
+
 _IDENT_POSE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
 
 
@@ -314,6 +334,7 @@ def main(
     split_in: pathlib.Path | None = None,
     gripper_action: str = "delta",
     fisheye_crop_frac: float | None = None,
+    tail_pad_frames: int = 0,
 ):
     import functools
     import json
@@ -348,7 +369,8 @@ def main(
     print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
     print(
         f"camera={camera} | gripper_action={gripper_action} | "
-        f"crop={'none' if crop_frac is None else f'{crop_frac:g} -> {img_shape[:2]}'}"
+        f"crop={'none' if crop_frac is None else f'{crop_frac:g} -> {img_shape[:2]}'} | "
+        f"tail_pad_frames={tail_pad_frames} (train only)"
     )
 
     episodes = _find_episodes(data_root)
@@ -430,6 +452,17 @@ def main(
             print(f"[{i + 1}/{len(episodes)}] SKIP({which}) {ep.parent.name}/{ep.name}: all-gap/too-short")
             continue
         ds = val_ds if which == "val" else train_ds
+        # TRAIN-ONLY tail padding: the LEFT release is the terminal action, so episodes end ~16 frames
+        # after it -> the "fully-open" gripper label is rare + the end-of-episode chunk is truncated, and
+        # the model under-opens the left gripper (wiki robotics-lab-pickplace-eval 2026-06-22). Freeze the
+        # last frame (image+state held) with a HOLD action (zero pose delta; gripper stays open) and append
+        # `tail_pad_frames` copies to the FINAL segment so the open target is no longer rare. Val is left
+        # UNPADDED (honest test). Only the last segment (true episode end), not gap-split boundaries.
+        n_pad_added = 0
+        if tail_pad_frames > 0 and which == "train" and segments:
+            hf = _make_hold_frame(segments[-1][-1], gripper_action)
+            segments[-1].extend(dict(hf) for _ in range(tail_pad_frames))
+            n_pad_added = tail_pad_frames
         kept = 0
         for seg in segments:
             for fr in seg:
@@ -438,7 +471,7 @@ def main(
             kept += len(seg)
         counts[which][0] += len(segments)
         counts[which][1] += kept
-        drop = n_writable - kept
+        drop = n_writable - (kept - n_pad_added)
         dropped_frames += drop
         if len(segments) > 1 or drop > 0:
             n_src_with_gaps += 1
@@ -456,6 +489,7 @@ def main(
                 "split_in": str(split_in) if split_in is not None else None,
                 "gripper_action": gripper_action,
                 "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,
+                "tail_pad_frames": tail_pad_frames,
                 "img_shape": list(img_shape),
                 "pose_frame": "tcp_tip" if tool_offset is not None else "raw_tracker_steamvr_world",
                 "retarget_config": str(retarget_config) if tool_offset is not None else None,

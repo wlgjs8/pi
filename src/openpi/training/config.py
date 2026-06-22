@@ -1295,6 +1295,34 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # TAIL-PAD experiment: identical to ..._h24_fe65_absgrip but the TRAIN set is tail-padded
+    # (`--tail-pad-frames 30`): freeze each episode's final frame with a hold-open action for +30 frames so
+    # the rare "fully-open" left-gripper label (16-frame tail, terminal left release) is no longer starved.
+    # Val is UNPADDED (honest test) -> eval on the existing ..._fe65_absgrip val to compare left_open detect
+    # vs the non-padded 10k/20k/30k. Trains to 30k. See [[robotics-lab-pickplace-eval]] left_open root cause.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip_tp30",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_8020_fe65_absgrip_tp30",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip_tp30"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
