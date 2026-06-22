@@ -20,6 +20,32 @@ from openpi.shared import nnx_utils
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
+# Real-Time Chunking (RTC) guidance fields the client may attach to the obs dict.
+# They are NOT model observation fields: they are popped before the input
+# transforms / Observation.from_dict and forwarded straight to sample_actions.
+# `prev_action_chunk` (H x action_dim, model action units) is the gate -- absent
+# means RTC is OFF. See openpi.models_pytorch.rtc and robotics_lab/docs/rtc_design.md.
+_RTC_OBS_KEYS = (
+    "prev_action_chunk",
+    "inference_delay",
+    "execute_horizon",
+    "prefix_attention_schedule",
+    "max_guidance_weight",
+)
+_RTC_SCALAR_KEYS = _RTC_OBS_KEYS[1:]  # everything except prev_action_chunk
+
+
+def _pop_rtc_kwargs(inputs: dict) -> dict:
+    """Remove the RTC guidance fields from the obs dict and return them.
+
+    Returns an empty dict (RTC OFF) unless ``prev_action_chunk`` is present.
+    Mutates ``inputs`` (a per-call copy in ``infer``), keeping the model
+    observation keys intact for the transforms.
+    """
+    if not isinstance(inputs, dict) or "prev_action_chunk" not in inputs:
+        return {}
+    return {key: inputs.pop(key) for key in _RTC_OBS_KEYS if key in inputs}
+
 
 class Policy(BasePolicy):
     def __init__(
@@ -68,6 +94,9 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        # Pull optional RTC guidance fields out before the transforms (they are
+        # not model observation fields). Empty unless the client sent a prev chunk.
+        rtc_kwargs = _pop_rtc_kwargs(inputs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -87,6 +116,22 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
+        # RTC: forward the guidance fields to sample_actions. PyTorch only -- the
+        # JAX sample_actions has no RTC path, so a prev chunk sent to a JAX model
+        # is ignored (RTC stays OFF) rather than raising.
+        if rtc_kwargs:
+            if self._is_pytorch_model:
+                prev = np.asarray(rtc_kwargs["prev_action_chunk"], dtype=np.float32)
+                prev_t = torch.from_numpy(prev).to(self._pytorch_device)
+                if prev_t.ndim == 2:  # (H, action_dim) -> add batch dim
+                    prev_t = prev_t[None, ...]
+                sample_kwargs["prev_action_chunk"] = prev_t
+                for key in _RTC_SCALAR_KEYS:
+                    if key in rtc_kwargs:
+                        sample_kwargs[key] = rtc_kwargs[key]
+            else:
+                logging.warning("RTC fields ignored: prev_action_chunk is only supported for PyTorch models")
+
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
@@ -99,7 +144,17 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        # RTC seeding: stash the model-space action chunk (BEFORE the output
+        # transform, i.e. the normalized units sample_actions denoises in) so the
+        # client can round-trip it back as `prev_action_chunk` next call. It is
+        # opaque to the client -- NOT un-normalized and NOT gripper-rescaled, so
+        # the freeze/guidance run in the same space the model sampled. PyTorch
+        # only (the JAX sample_actions has no RTC path).
+        rtc_raw_actions = np.asarray(outputs["actions"]).copy() if self._is_pytorch_model else None
+
         outputs = self._output_transform(outputs)
+        if rtc_raw_actions is not None:
+            outputs["rtc_raw_actions"] = rtc_raw_actions
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

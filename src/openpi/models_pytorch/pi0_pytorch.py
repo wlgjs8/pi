@@ -376,8 +376,28 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    def sample_actions(
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        *,
+        prev_action_chunk=None,
+        inference_delay=0,
+        execute_horizon=None,
+        prefix_attention_schedule="exp",
+        max_guidance_weight=5.0,
+    ) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
+
+        Real-Time Chunking (RTC): when ``prev_action_chunk`` is supplied, the next
+        chunk is denoised while freezing its first ``inference_delay`` actions and
+        inpainting the rest toward the previous chunk (guided denoising). With
+        ``prev_action_chunk=None`` (the default) the sampling is byte-identical to
+        the vanilla flow loop, so RTC stays OFF by default. See
+        ``openpi.models_pytorch.rtc`` and ``robotics_lab/docs/rtc_design.md``.
+        """
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -400,6 +420,26 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        # RTC branch: freeze the committed prefix + inpaint toward the previous
+        # chunk. Reuses the model's KV-cached denoise_step as the velocity field;
+        # rtc_sample_openpi mirrors the vanilla Euler grid below but adds the
+        # freeze + guidance (openpi time convention). Skipped when no prev chunk.
+        if prev_action_chunk is not None:
+            from .rtc import rtc_sample_openpi
+
+            prev = torch.as_tensor(prev_action_chunk, dtype=noise.dtype, device=device)
+            exec_h = int(execute_horizon) if execute_horizon is not None else self.config.action_horizon
+            return rtc_sample_openpi(
+                noise,
+                lambda xx, t: self.denoise_step(state, prefix_pad_masks, past_key_values, xx, t.expand(bsize)),
+                prev_action_chunk=prev,
+                inference_delay=int(inference_delay),
+                execute_horizon=exec_h,
+                num_steps=num_steps,
+                prefix_attention_schedule=prefix_attention_schedule,
+                max_guidance_weight=float(max_guidance_weight),
+            )
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
