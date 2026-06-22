@@ -137,7 +137,7 @@ def _state(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
     ).astype(np.float32)
 
 
-def _arm_actions(pose, grip, gripper_action: str) -> np.ndarray:
+def _arm_actions(pose, grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
     cur = Rotation.from_quat(pose[:-1, 3:7])
     nxt = Rotation.from_quat(pose[1:, 3:7])
     pos_delta_world = pose[1:, :3] - pose[:-1, :3]
@@ -146,18 +146,23 @@ def _arm_actions(pose, grip, gripper_action: str) -> np.ndarray:
     # Pose stays an ee_local per-step delta; only the GRIPPER channel switches representation:
     #   delta    : (grip[t+1]-grip[t])/100  -- needs runtime integration at deploy (accumulates drift)
     #   absolute : grip[t+1]/100            -- the target opening; self-correcting, no integration
-    # Proprio gripper is the absolute current opening either way, so absolute = predict the target
-    # directly from the current state.
-    if gripper_action == "absolute":
+    #   binary   : 1{grip[t+1] >= th}       -- open(1)/closed(0); strips the task-irrelevant open-angle
+    #              noise (~40-95 random) + the under-close. Deploy commands 0 -> firm close (bolt blocks
+    #              at its width) / 1 -> open, via the same absolute path (no deploy change).
+    # Proprio gripper stays the absolute current opening in every mode.
+    if gripper_action == "binary":
+        grip_col = (grip[1:] >= binary_th).astype(np.float64)[:, None]
+    elif gripper_action == "absolute":
         grip_col = (grip[1:] / 100.0)[:, None]
     else:
         grip_col = ((grip[1:] - grip[:-1]) / 100.0)[:, None]
     return np.concatenate([pos_delta_local, rot_delta, grip_col], axis=1).astype(np.float32)
 
 
-def _actions(left_pose, right_pose, left_grip, right_grip, gripper_action: str) -> np.ndarray:
+def _actions(left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
     return np.concatenate(
-        [_arm_actions(left_pose, left_grip, gripper_action), _arm_actions(right_pose, right_grip, gripper_action)],
+        [_arm_actions(left_pose, left_grip, gripper_action, binary_th),
+         _arm_actions(right_pose, right_grip, gripper_action, binary_th)],
         axis=1,
     ).astype(np.float32)
 
@@ -237,6 +242,7 @@ def _episode_frames(
     camera: str,
     crop_frac: float | None,
     gripper_action: str,
+    binary_th: float = 25.0,
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -273,7 +279,7 @@ def _episode_frames(
         right_images = R[f"images/{camera}_color"]
 
         states = _state(left_pose, right_pose, left_grip, right_grip)
-        actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action)
+        actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
         if actions.shape[0] != states.shape[0] - 1:
             raise ValueError("length mismatch")
         n_act = actions.shape[0]  # writable frames 0..n_act-1; action[t] spans ts[t]->ts[t+1]
@@ -335,6 +341,11 @@ def main(
     gripper_action: str = "delta",
     fisheye_crop_frac: float | None = None,
     tail_pad_frames: int = 0,
+    gripper_binary_th: float = 25.0,  # gripper_action=binary: opening >= th -> 1 (open) else 0 (closed/grip)
+    exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
+    # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
+    # (Unlike --split-in, which reproduces the EXACT split and DROPS episodes not in train|val.)
+    val_from_record: pathlib.Path | None = None,
 ):
     import functools
     import json
@@ -342,8 +353,8 @@ def main(
 
     if camera not in ("realsense", "fisheye"):
         raise ValueError(f"--camera must be 'realsense' or 'fisheye', got {camera!r}")
-    if gripper_action not in ("delta", "absolute"):
-        raise ValueError(f"--gripper-action must be 'delta' or 'absolute', got {gripper_action!r}")
+    if gripper_action not in ("delta", "absolute", "binary"):
+        raise ValueError(f"--gripper-action must be 'delta', 'absolute', or 'binary', got {gripper_action!r}")
     # Center-crop only makes sense for the wide-FOV fisheye; ignore it for realsense so an A/B keeps
     # the realsense arm at full frame.
     crop_frac = fisheye_crop_frac if (camera == "fisheye" and fisheye_crop_frac) else None
@@ -374,6 +385,10 @@ def main(
     )
 
     episodes = _find_episodes(data_root)
+    if exclude_path_substr:
+        n0 = len(episodes)
+        episodes = [e for e in episodes if exclude_path_substr not in str(e)]
+        print(f"excluded {n0 - len(episodes)} episodes matching path substr {exclude_path_substr!r} -> {len(episodes)} remain")
     # Drop episodes already used in a prior split (build a fresh/unseen test set from new collection).
     if exclude_record is not None:
         ex = json.loads(pathlib.Path(exclude_record).read_text())
@@ -387,7 +402,17 @@ def main(
     def _key(e: pathlib.Path) -> str:
         return f"{e.parent.name}/{e.name}"
 
-    if split_in is not None:
+    if val_from_record is not None:
+        # Pin val to a prior split's `val` list; everything ELSE (incl. newly collected episodes) -> train.
+        rec = json.loads(pathlib.Path(val_from_record).read_text())
+        val_keys = set(rec.get("val", []))
+        miss = val_keys - {_key(e) for e in episodes}
+        if miss:
+            raise SystemExit(f"--val-from-record: {len(miss)} pinned val episodes not found: {sorted(miss)[:5]}")
+        val_idx = {i for i, e in enumerate(episodes) if _key(e) in val_keys}
+        n_val = len(val_idx)
+        print(f"val-from-record {val_from_record}: {n_val} val pinned, {len(episodes) - n_val} -> train (new episodes included)")
+    elif split_in is not None:
         # Reproduce an EXACT prior split (e.g. the tcp_8020 realsense run) so a fisheye dataset
         # differs only in pixels -> apples-to-apples camera comparison AND reusable norm-stats
         # (state/actions identical). Assign by the recorded train/val episode lists; drop any
@@ -429,7 +454,7 @@ def main(
         for attempt in range(4):
             try:
                 segments, n_writable = _episode_frames(
-                    ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action
+                    ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action, gripper_binary_th
                 )
                 break
             except Exception as e:
@@ -488,6 +513,9 @@ def main(
                 "camera": camera,
                 "split_in": str(split_in) if split_in is not None else None,
                 "gripper_action": gripper_action,
+                "gripper_binary_th": gripper_binary_th if gripper_action == "binary" else None,
+                "val_from_record": str(val_from_record) if val_from_record is not None else None,
+                "exclude_path_substr": exclude_path_substr,
                 "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,
                 "tail_pad_frames": tail_pad_frames,
                 "img_shape": list(img_shape),
