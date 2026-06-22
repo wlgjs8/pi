@@ -41,11 +41,32 @@ PROMPT = (
 )
 
 
-def _decode_color(encoded: np.ndarray) -> np.ndarray:
+def _decode_color(encoded: np.ndarray, crop_frac: float | None = None) -> np.ndarray:
     bgr = cv2.imdecode(np.asarray(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
     if bgr is None:
         raise ValueError("Failed to decode color frame")
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    if crop_frac is not None:
+        rgb = _center_crop(rgb, crop_frac)
+    return rgb
+
+
+def _center_crop(img: np.ndarray, frac: float) -> np.ndarray:
+    """Centered crop keeping `frac` of each dimension (aspect preserved). Used for the wide-FOV
+    fisheye: dropping the strongly barrel-distorted periphery + vignette corners pulls the image
+    closer to a rectilinear/pi0.5-style view AND lets the downstream resize spend its 224 budget on
+    the central working area (better small-bolt detail) instead of distorted edges."""
+    h, w = img.shape[:2]
+    ch, cw = int(round(h * frac)), int(round(w * frac))
+    y0, x0 = (h - ch) // 2, (w - cw) // 2
+    return img[y0 : y0 + ch, x0 : x0 + cw]
+
+
+def _crop_shape(frac: float | None, base=(480, 640)) -> tuple[int, int, int]:
+    h, w = base
+    if frac is None:
+        return (h, w, 3)
+    return (int(round(h * frac)), int(round(w * frac)), 3)
 
 
 _IDENT_POSE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
@@ -96,19 +117,28 @@ def _state(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
     ).astype(np.float32)
 
 
-def _arm_actions(pose, grip) -> np.ndarray:
+def _arm_actions(pose, grip, gripper_action: str) -> np.ndarray:
     cur = Rotation.from_quat(pose[:-1, 3:7])
     nxt = Rotation.from_quat(pose[1:, 3:7])
     pos_delta_world = pose[1:, :3] - pose[:-1, :3]
     pos_delta_local = cur.inv().apply(pos_delta_world)
     rot_delta = (cur.inv() * nxt).as_rotvec()
-    grip_delta = ((grip[1:] - grip[:-1]) / 100.0)[:, None]
-    return np.concatenate([pos_delta_local, rot_delta, grip_delta], axis=1).astype(np.float32)
+    # Pose stays an ee_local per-step delta; only the GRIPPER channel switches representation:
+    #   delta    : (grip[t+1]-grip[t])/100  -- needs runtime integration at deploy (accumulates drift)
+    #   absolute : grip[t+1]/100            -- the target opening; self-correcting, no integration
+    # Proprio gripper is the absolute current opening either way, so absolute = predict the target
+    # directly from the current state.
+    if gripper_action == "absolute":
+        grip_col = (grip[1:] / 100.0)[:, None]
+    else:
+        grip_col = ((grip[1:] - grip[:-1]) / 100.0)[:, None]
+    return np.concatenate([pos_delta_local, rot_delta, grip_col], axis=1).astype(np.float32)
 
 
-def _actions(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
+def _actions(left_pose, right_pose, left_grip, right_grip, gripper_action: str) -> np.ndarray:
     return np.concatenate(
-        [_arm_actions(left_pose, left_grip), _arm_actions(right_pose, right_grip)], axis=1
+        [_arm_actions(left_pose, left_grip, gripper_action), _arm_actions(right_pose, right_grip, gripper_action)],
+        axis=1,
     ).astype(np.float32)
 
 
@@ -151,12 +181,12 @@ def _find_episodes(data_root: pathlib.Path) -> list[pathlib.Path]:
     return eps
 
 
-def _make_dataset(repo_id: str, root: pathlib.Path):
+def _make_dataset(repo_id: str, root: pathlib.Path, img_shape: tuple[int, int, int] = (480, 640, 3)):
     import shutil
 
     if root.exists():
         shutil.rmtree(root)
-    _img_feat = {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]}
+    _img_feat = {"dtype": "video", "shape": img_shape, "names": ["height", "width", "channel"]}
     features = {
         "left_wrist_0_rgb": _img_feat,
         "right_wrist_0_rgb": _img_feat,
@@ -171,12 +201,23 @@ def _make_dataset(repo_id: str, root: pathlib.Path):
         features=features,
         use_videos=True,
         video_backend="pyav",
-        image_writer_threads=16,
-        image_writer_processes=4,
+        # Lowered from 16/4: the encoder writes video to the same NFS we read raw episodes from; high
+        # write concurrency was contending with reads and triggering transient errno-5 EIO (see the
+        # read-retry note in main). Fewer writers = less NFS pressure, at a modest encode-speed cost.
+        image_writer_threads=8,
+        image_writer_processes=2,
     )
 
 
-def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s: float, min_seg_frames: int):
+def _episode_frames(
+    ep: pathlib.Path,
+    tool_offset: dict | None,
+    gap_threshold_s: float,
+    min_seg_frames: int,
+    camera: str,
+    crop_frac: float | None,
+    gripper_action: str,
+):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
     Some episodes were collected before the 30 Hz pipeline was stabilized and carry multi-second
@@ -204,11 +245,15 @@ def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s:
             right_pose = _apply_tool_offset(right_pose, tool_offset["right"])
         left_grip = np.nan_to_num(np.asarray(L["gripper"], dtype=np.float64)[:, 0])
         right_grip = np.nan_to_num(np.asarray(R["gripper"], dtype=np.float64)[:, 0])
-        left_images = L["images/realsense_color"]
-        right_images = R["images/realsense_color"]
+        # Camera source is swappable: realsense_color (default) or fisheye_color. Both decode to
+        # (480,640,3) uint8, so the LeRobot feature shape + downstream config are identical -- only
+        # the pixel content (wide-FOV fisheye vs RealSense) changes. The camera keys stay
+        # left/right_wrist_0_rgb so an existing config trains on the swapped images unchanged.
+        left_images = L[f"images/{camera}_color"]
+        right_images = R[f"images/{camera}_color"]
 
         states = _state(left_pose, right_pose, left_grip, right_grip)
-        actions = _actions(left_pose, right_pose, left_grip, right_grip)
+        actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action)
         if actions.shape[0] != states.shape[0] - 1:
             raise ValueError("length mismatch")
         n_act = actions.shape[0]  # writable frames 0..n_act-1; action[t] spans ts[t]->ts[t+1]
@@ -236,8 +281,8 @@ def _episode_frames(ep: pathlib.Path, tool_offset: dict | None, gap_threshold_s:
         out = [
             [
                 {
-                    "left_wrist_0_rgb": _decode_color(left_images[t]),
-                    "right_wrist_0_rgb": _decode_color(right_images[t]),
+                    "left_wrist_0_rgb": _decode_color(left_images[t], crop_frac),
+                    "right_wrist_0_rgb": _decode_color(right_images[t], crop_frac),
                     "state": states[t],
                     "actions": actions[t],
                     "task": PROMPT,
@@ -265,9 +310,25 @@ def main(
     ),
     gap_threshold_s: float = 0.1,
     min_seg_frames: int = 16,
+    camera: str = "realsense",
+    split_in: pathlib.Path | None = None,
+    gripper_action: str = "delta",
+    fisheye_crop_frac: float | None = None,
 ):
     import functools
     import json
+    import time
+
+    if camera not in ("realsense", "fisheye"):
+        raise ValueError(f"--camera must be 'realsense' or 'fisheye', got {camera!r}")
+    if gripper_action not in ("delta", "absolute"):
+        raise ValueError(f"--gripper-action must be 'delta' or 'absolute', got {gripper_action!r}")
+    # Center-crop only makes sense for the wide-FOV fisheye; ignore it for realsense so an A/B keeps
+    # the realsense arm at full frame.
+    crop_frac = fisheye_crop_frac if (camera == "fisheye" and fisheye_crop_frac) else None
+    if fisheye_crop_frac is not None and not (0.0 < fisheye_crop_frac <= 1.0):
+        raise ValueError(f"--fisheye-crop-frac must be in (0,1], got {fisheye_crop_frac}")
+    img_shape = _crop_shape(crop_frac)
 
     # LeRobot 0.1.0's encode_episode_videos() calls encode_video_frames() WITHOUT a vcodec arg, so
     # it always uses the libsvtav1 default. Monkeypatch the name in the dataset module to pin our
@@ -285,6 +346,10 @@ def main(
     else:
         print("pose frame: raw tracker (steamvr_world, NO tool offset) -- legacy *_8020 behavior")
     print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
+    print(
+        f"camera={camera} | gripper_action={gripper_action} | "
+        f"crop={'none' if crop_frac is None else f'{crop_frac:g} -> {img_shape[:2]}'}"
+    )
 
     episodes = _find_episodes(data_root)
     # Drop episodes already used in a prior split (build a fresh/unseen test set from new collection).
@@ -296,16 +361,36 @@ def main(
     if limit is not None:
         episodes = episodes[:limit]
 
-    # Deterministic episode-level split: whole episodes go to val (no within-episode frame leakage).
-    # val_frac<=0 -> single dataset (everything to train_repo_id), e.g. for a fresh test set.
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(episodes))
-    n_val = max(1, round(val_frac * len(episodes))) if val_frac > 0 else 0
-    val_idx = set(order[:n_val].tolist())
-    print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val")
+    # Episode-level split: whole episodes go to val (no within-episode frame leakage).
+    def _key(e: pathlib.Path) -> str:
+        return f"{e.parent.name}/{e.name}"
 
-    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id)
-    val_ds = _make_dataset(val_repo_id, lerobot_home / val_repo_id) if n_val > 0 else None
+    if split_in is not None:
+        # Reproduce an EXACT prior split (e.g. the tcp_8020 realsense run) so a fisheye dataset
+        # differs only in pixels -> apples-to-apples camera comparison AND reusable norm-stats
+        # (state/actions identical). Assign by the recorded train/val episode lists; drop any
+        # episode not in the recorded split (collection may have grown since).
+        rec = json.loads(pathlib.Path(split_in).read_text())
+        train_keys, val_keys = set(rec.get("train", [])), set(rec.get("val", []))
+        known = train_keys | val_keys
+        episodes = [e for e in episodes if _key(e) in known]
+        val_idx = {i for i, e in enumerate(episodes) if _key(e) in val_keys}
+        n_val = len(val_idx)
+        missing = known - {_key(e) for e in episodes}
+        print(
+            f"reproducing split from {split_in}: {len(episodes) - n_val} train / {n_val} val "
+            f"(camera={camera}); {len(missing)} recorded episodes not found on disk"
+        )
+    else:
+        # Deterministic episode-level split. val_frac<=0 -> single dataset (everything to train_repo_id).
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(len(episodes))
+        n_val = max(1, round(val_frac * len(episodes))) if val_frac > 0 else 0
+        val_idx = set(order[:n_val].tolist())
+        print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val (camera={camera})")
+
+    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape)
+    val_ds = _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape) if n_val > 0 else None
 
     counts = {"train": [0, 0], "val": [0, 0]}  # [segments(=lerobot episodes), frames]
     skipped = []
@@ -314,11 +399,31 @@ def main(
     n_src_with_gaps = 0  # source episodes that produced >1 segment or lost frames
     for i, ep in enumerate(episodes):
         which = "val" if i in val_idx else "train"
-        try:
-            segments, n_writable = _episode_frames(ep, tool_offset, gap_threshold_s, min_seg_frames)
-        except Exception as e:  # incomplete/locked file (concurrent collection) or bad data
-            skipped.append((str(ep), repr(e)))
-            print(f"[{i + 1}/{len(episodes)}] SKIP({which}) {ep.parent.name}/{ep.name}: {e}")
+        # Reads come off the same NFS the encoder writes to; under heavy concurrent load the server can
+        # return transient errno-5 EIO (verified: the same files read fine once load drops). Retry those
+        # with backoff so a transient blip doesn't silently drop a good episode. Real data errors
+        # (tracking dropout / no clean segment / length mismatch -> ValueError) are NOT retried.
+        segments = n_writable = None
+        for attempt in range(4):
+            try:
+                segments, n_writable = _episode_frames(
+                    ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action
+                )
+                break
+            except Exception as e:
+                msg = str(e)
+                transient = isinstance(e, OSError) or any(
+                    s in msg for s in ("Input/output error", "file read failed", "errno = 5")
+                )
+                if transient and attempt < 3:
+                    print(f"[{i + 1}/{len(episodes)}] retry {attempt + 1}/3 {ep.parent.name}/{ep.name}: EIO")
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                skipped.append((str(ep), repr(e)))
+                print(f"[{i + 1}/{len(episodes)}] SKIP({which}) {ep.parent.name}/{ep.name}: {e}")
+                segments = None
+                break
+        if segments is None:
             continue
         if not segments:
             skipped.append((str(ep), "no clean segment >= min_seg_frames"))
@@ -347,6 +452,11 @@ def main(
             {
                 "seed": seed,
                 "val_frac": val_frac,
+                "camera": camera,
+                "split_in": str(split_in) if split_in is not None else None,
+                "gripper_action": gripper_action,
+                "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,
+                "img_shape": list(img_shape),
                 "pose_frame": "tcp_tip" if tool_offset is not None else "raw_tracker_steamvr_world",
                 "retarget_config": str(retarget_config) if tool_offset is not None else None,
                 "gap_threshold_s": gap_threshold_s,

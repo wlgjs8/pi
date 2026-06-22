@@ -83,6 +83,11 @@ def main() -> None:
     parser.add_argument("--n-select", type=int, default=1,
                         help="if >1, wrap in MedoidPolicy: sample N chunks/frame and use the consensus "
                              "(medoid) chunk for all metrics — measures performance WITH best-of-N selection")
+    parser.add_argument("--gripper-action", type=str, default="delta", choices=["delta", "absolute"],
+                        help="gripper action representation: 'delta' (free-run integrates pred*stride) or "
+                             "'absolute' (pred IS the opening /100; reconstruct directly, no integration)")
+    parser.add_argument("--horizon", type=int, default=None,
+                        help="action horizon; default = the config model's action_horizon")
     args = parser.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -108,14 +113,24 @@ def main() -> None:
     # Fixed normalizer from the val GT actions (checkpoint-independent -> comparable across runs).
     action_std = actions_all.std(axis=0)
     scale = float(np.mean(np.square(np.maximum(action_std, 1e-12))))
+    # POSE-only (12-dim) scale: exclude the two gripper dims (6,13). Because the gripper representation
+    # (delta vs absolute) changes the gripper-dim variance and thus the 14-dim normalizer, the full
+    # normalized MSE is NOT comparable across gripper reps. Pose-only error normalized by pose-only std
+    # isolates trajectory accuracy and IS comparable across gripper reps and cameras.
+    POSE_DIMS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+    pose_scale = float(np.mean(np.square(np.maximum(action_std[POSE_DIMS], 1e-12))))
 
-    policy = _policy_config.create_trained_policy(_config.get_config(args.config), str(ckpt_dir))
+    cfg = _config.get_config(args.config)
+    HORIZON = int(args.horizon) if args.horizon else int(cfg.model.action_horizon)
+    print(f"horizon={HORIZON} | gripper_action={args.gripper_action} | config={args.config}")
+    policy = _policy_config.create_trained_policy(cfg, str(ckpt_dir))
     if args.n_select > 1:
         from openpi.policies.policy import MedoidPolicy
         policy = MedoidPolicy(policy, num_samples=args.n_select)
         print(f"selection: medoid-of-{args.n_select} (consensus best-of-N) — all metrics use the selected chunk")
 
     sq_first, n_first = 0.0, 0.0
+    pose_sq, pose_n = 0.0, 0.0  # first-step POSE-only (12-dim, gripper excluded) MSE
     sq_chunk, n_chunk = 0.0, 0.0
     chunk_pos_sq = [0.0] * HORIZON  # normalized action MSE per chunk position (step 0..H-1)
     chunk_pos_n = [0] * HORIZON
@@ -170,6 +185,7 @@ def main() -> None:
                 chunk_pos_sq[k] += float(err2[k].sum()); chunk_pos_n[k] += err2[k].size
             first = err2[0]
             sq_first += float(first.sum()); n_first += first.size
+            pose_sq += float(first[POSE_DIMS].sum()); pose_n += len(POSE_DIMS)
             phase = bounds.phase_for_frame(t)
             phase_sq[phase] += float(first.sum()); phase_n[phase] += first.size
             if phase == "right_pick":
@@ -207,9 +223,13 @@ def main() -> None:
                 th = phase_mod.gripper_thresholds(gt_grip[arm])
                 if th is None or len(sf) < 2:
                     continue
-                fr = [float(gt_grip[arm][sf[0]])]
-                for k in range(1, len(sf)):
-                    fr.append(min(100.0, max(0.0, fr[-1] + pdg[arm][k - 1] * 100.0 * args.stride)))
+                if args.gripper_action == "absolute":
+                    # predicted gripper IS the absolute opening (/100) -> reconstruct directly, no integration
+                    fr = [min(100.0, max(0.0, pdg[arm][k] * 100.0)) for k in range(len(sf))]
+                else:
+                    fr = [float(gt_grip[arm][sf[0]])]
+                    for k in range(1, len(sf)):
+                        fr.append(min(100.0, max(0.0, fr[-1] + pdg[arm][k - 1] * 100.0 * args.stride)))
                 ev = phase_mod.gripper_events(np.asarray(fr), thresholds=th)
                 pred_frames = {"close": [sf[k] for k in ev["close"]], "open": [sf[k] for k in ev["open"]]}
                 for ev_name, direction in ((ev_close, "close"), (ev_open, "open")):
@@ -227,6 +247,7 @@ def main() -> None:
     result = {
         "checkpoint_step": args.checkpoint_step,
         "config": args.config,
+        "gripper_action": args.gripper_action,
         "ckpt_base": args.ckpt_base,
         "val_repo_id": args.val_repo_id,
         "n_select": args.n_select,
@@ -242,6 +263,13 @@ def main() -> None:
         "first_step": {
             "action_mse": sq_first / max(n_first, 1.0),
             "normalized_action_mse": (sq_first / max(n_first, 1.0)) / scale,
+        },
+        "first_step_pose_only_12dim": {
+            "action_mse": pose_sq / max(pose_n, 1.0),
+            "normalized_action_mse": (pose_sq / max(pose_n, 1.0)) / pose_scale,
+            "pose_scale": pose_scale,
+            "note": "12 pose dims (gripper 6,13 excluded), normalized by pose-only val action std -> "
+                    "comparable across gripper reps (delta/absolute) and cameras",
         },
         "chunk8": {
             "action_mse": sq_chunk / max(n_chunk, 1.0),

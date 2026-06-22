@@ -1213,6 +1213,62 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # A/B camera comparison at h24, BOTH with the new ABSOLUTE gripper action (target opening grip[t+1]/100,
+    # not the delta -- self-correcting, no deploy-time integration drift). Same tcp retarget + SAME 343/86
+    # episode split as _8020 (converter --split-in pika_umi_video_split_tcp_8020.json), so the two runs differ
+    # ONLY in the wrist image -> isolates "fisheye matching-gain (deploy cam is fisheye) vs RGB detail-loss".
+    # Recompute norm-stats per repo_id first (absolute gripper changes the action distribution vs the delta runs).
+    #
+    # A) RealSense color, full frame (the detail-rich but narrower-FOV modality).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_8020_h24_rs_absgrip",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_8020_rs_absgrip",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_rs_absgrip"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # B) Fisheye, center-cropped to 0.65 of the frame -> (312,416) (drops the barrel-distorted/vignette
+    # periphery, spends the 224 resize budget on the central working area for better small-bolt detail,
+    # and matches the deploy fisheye camera). Cropped at CONVERSION time (baked into the stored video).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_8020_fe65_absgrip",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
