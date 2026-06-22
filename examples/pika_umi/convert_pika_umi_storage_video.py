@@ -343,6 +343,7 @@ def main(
     tail_pad_frames: int = 0,
     gripper_binary_th: float = 25.0,  # gripper_action=binary: opening >= th -> 1 (open) else 0 (closed/grip)
     exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
+    include_path_substr: str | None = None,  # keep ONLY episodes whose path contains this (e.g. "onrobot_rgbd")
     # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
     # (Unlike --split-in, which reproduces the EXACT split and DROPS episodes not in train|val.)
     val_from_record: pathlib.Path | None = None,
@@ -385,6 +386,10 @@ def main(
     )
 
     episodes = _find_episodes(data_root)
+    if include_path_substr:
+        n0 = len(episodes)
+        episodes = [e for e in episodes if include_path_substr in str(e)]
+        print(f"kept {len(episodes)}/{n0} episodes matching path substr {include_path_substr!r}")
     if exclude_path_substr:
         n0 = len(episodes)
         episodes = [e for e in episodes if exclude_path_substr not in str(e)]
