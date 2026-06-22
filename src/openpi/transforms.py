@@ -248,6 +248,66 @@ class ImageTransformConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class DartNoiseConfig:
+    """Train-only DART-style covariate-shift augmentation (offline recovery labels).
+
+    DART (arXiv 1703.09327): perturb the demonstration so the expert teaches RECOVERY back to the
+    manifold, attacking the compounding error that makes teacher-forced-good policies fail in rollout.
+    Offline analog on our ee_local-delta + reset-relative-proprio data: displace the proprio pose by a
+    small body-frame Gaussian eps and BEND the first `recover_steps` action-chunk steps to cancel eps
+    (so the policy, believing it is eps off-position, steers back toward the demo's next pose). The real
+    image is kept (valid for small sigma -- the wrist view barely changes). Translation-only, per-arm;
+    rotation + gripper untouched. Mainly hardens POSE/proprio drift (the 'deltas accumulate to a wrong
+    absolute position' failure); visual covariate shift still needs collection-time noise / on-policy data."""
+
+    sigma_pos_m: float = 0.01   # body-frame translation noise std (m)
+    recover_steps: int = 5      # spread the recovery over the first K chunk steps (each absorbs eps/K)
+    prob: float = 1.0           # per-arm probability of applying the perturbation
+
+
+def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
+    """Rodrigues: rotation-vector -> 3x3 matrix (numpy-only, no scipy/cv2 dep)."""
+    rotvec = np.asarray(rotvec, dtype=np.float64)
+    theta = float(np.linalg.norm(rotvec))
+    if theta < 1e-8:
+        return np.eye(3, dtype=np.float32)
+    k = rotvec / theta
+    kx = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    R = np.eye(3) + np.sin(theta) * kx + (1.0 - np.cos(theta)) * (kx @ kx)
+    return R.astype(np.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectDartNoise(DataTransformFn):
+    """Train-only. Operates on the raw 14-D ``data["state"]`` (reset-relative pose+gripper) and the
+    (H,14) ``data["actions"]`` chunk (ee_local per-step deltas), BEFORE normalization. Inference and
+    norm-stat computation never see it. Layout per arm: pos=[0:3]/[7:10], rot=[3:6]/[10:13], grip=6/13."""
+
+    cfg: DartNoiseConfig
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or "state" not in data:
+            return data
+        state = np.asarray(data["state"], dtype=np.float32).copy()
+        actions = np.asarray(data["actions"], dtype=np.float32).copy()
+        if actions.ndim != 2 or actions.shape[1] < 14 or state.shape[0] < 14:
+            return data
+        H = actions.shape[0]
+        K = max(1, min(self.cfg.recover_steps, H))
+        for pos, rot in (([0, 1, 2], [3, 4, 5]), ([7, 8, 9], [10, 11, 12])):
+            if np.random.random() > self.cfg.prob:
+                continue
+            eps = np.random.normal(0.0, self.cfg.sigma_pos_m, size=3).astype(np.float32)  # body-frame
+            R_rel = _rotvec_to_matrix(state[rot])  # exp(rot_rel) = R0^-1 R_t : body -> reset frame
+            state[pos] = state[pos] + R_rel @ eps  # proprio now reports the displaced pose
+            actions[:K, pos] = actions[:K, pos] - (eps / K)  # first K deltas recover toward the demo
+        data = dict(data)
+        data["state"] = state
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class AugmentImages(DataTransformFn):
     """Train-only per-camera image augmentation. Operates on uint8 HWC images in
     ``data["image"]`` (after the policy input transform builds the image dict, before

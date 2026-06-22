@@ -83,6 +83,9 @@ class DataConfig:
     # If set, train-only image augmentation applied in the training data pipeline (NOT at
     # inference or norm-stat computation, which build their transform stacks separately).
     image_aug: _transforms.ImageTransformConfig | None = None
+    # If set, train-only DART-style state/action recovery-noise augmentation (covariate-shift /
+    # compounding-error fix). Applied in the training pipeline only, on raw state/actions before norm.
+    dart_noise: _transforms.DartNoiseConfig | None = None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
@@ -1340,6 +1343,33 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # DART experiment: IDENTICAL to ..._binary_h50 (same dataset, no re-conversion) + train-only
+    # DART-style recovery-noise augmentation (covariate-shift / compounding-error). Targets the
+    # 2026-06-22 diagnosis (teacher-forced OK, rollout 50/50 approach = closed-loop §5). Reuses the
+    # binary_h50 LeRobot dataset; recompute norm-stats for this assets_dir (DART is applied AFTER
+    # PikaUmiInputs / BEFORE norm, so norm-stats are computed clean and match binary_h50).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_binary_h50_dart",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_dart"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dart_noise=_transforms.DartNoiseConfig(sigma_pos_m=0.01, recover_steps=5, prob=0.5),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
