@@ -102,21 +102,30 @@ def _depth_to_image(
     return np.repeat(g[..., None], 3, axis=2)
 
 
-def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "pose") -> dict:
-    """A frozen 'hold' frame: last image + state held, action = stay-put (zero pose delta; gripper stays
-    at its current opening). Appended to an episode's FINAL segment to extend the short post-release tail
-    (see the tail-pad rationale at the write loop). Action layout is 14-D
-    [L pos3, L rot3, L grip(6), R pos3, R rot3, R grip(13)].
-    State layout depends on state_mode: pose -> 14-D reset-relative pose (held); velocity -> 12-D ee_local
-    velocity, which for a stay-put hold is ZERO (no motion), not the last frame's velocity."""
-    hold = np.zeros(14, dtype=np.float32)
-    if gripper_action == "absolute":
-        # absolute action gripper = next-step opening; holding means keep the current (open) opening
-        hold[6] = last_frame["state"][6]
-        hold[13] = last_frame["state"][13]
-    # delta mode: zero gripper delta == hold (leave hold[6]/[13] at 0)
-    # velocity proprio: a stay-put hold has zero velocity; pose proprio: hold the last pose.
-    hold_state = np.zeros_like(last_frame["state"]) if state_mode == "velocity" else last_frame["state"]
+def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "pose", action_mode: str = "delta") -> dict:
+    """A frozen 'hold' frame: last image + state held, action = stay-put. Appended to an episode's FINAL
+    segment to extend the short post-release tail (see the tail-pad rationale at the write loop).
+    Action: delta mode -> zero pose delta (+ held absolute gripper); anchored mode -> repeat the last
+    per-frame ABSOLUTE pose (staying put = same target), gripper carried within it.
+    State: pose -> 14-D held; velocity -> 12-D ZERO (no motion); velocity_grip -> 14-D, velocity dims
+    zeroed but the absolute gripper (6,13) held."""
+    if action_mode == "anchored":
+        hold = np.asarray(last_frame["actions"], dtype=np.float32).copy()  # stay at the last abs pose
+    else:
+        hold = np.zeros(14, dtype=np.float32)
+        if gripper_action == "absolute":
+            # absolute action gripper = next-step opening; holding means keep the current (open) opening
+            hold[6] = last_frame["state"][6]
+            hold[13] = last_frame["state"][13]
+        # delta mode: zero gripper delta == hold (leave hold[6]/[13] at 0)
+    st = np.asarray(last_frame["state"], dtype=np.float32)
+    if state_mode == "velocity":
+        hold_state = np.zeros_like(st)
+    elif state_mode == "velocity_grip":
+        hold_state = st.copy()
+        hold_state[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]] = 0.0  # zero velocity, keep gripper 6,13
+    else:
+        hold_state = st
     out = {
         "left_wrist_0_rgb": last_frame["left_wrist_0_rgb"],
         "right_wrist_0_rgb": last_frame["right_wrist_0_rgb"],
@@ -198,6 +207,49 @@ def _state_velocity(left_pose, right_pose) -> np.ndarray:
     EE is currently moving. Gripper proprio is intentionally dropped (the action still predicts the
     binary gripper). Across a frame-time gap the incoming step is bogus; the caller zeros those rows."""
     return np.concatenate([_arm_velocity(left_pose), _arm_velocity(right_pose)], axis=1).astype(np.float32)
+
+
+def _state_velocity_grip(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
+    """VELOCITY + ABSOLUTE-GRIPPER proprio (14-D): per arm [pos_vel_local(3), rot_vel(3), grip/100].
+    Same init-pose-independent ee_local velocity as `velocity`, but ADDS the current absolute gripper
+    opening back (the velproprio 12-D dropped it). Matches the deploy runtime `proprio_mode=velocity_grip`.
+    Across a gap the VELOCITY part is bogus; the caller zeros only the velocity dims (keeps the gripper)."""
+    return np.concatenate(
+        [
+            _arm_velocity(left_pose),
+            (left_grip[:, None] / 100.0),
+            _arm_velocity(right_pose),
+            (right_grip[:, None] / 100.0),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+def _arm_actions_anchored(pose, grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
+    """ANCHORED-TRAJECTORY action (UMI-style), per-frame STORAGE form: the tool-frame ABSOLUTE pose at
+    each frame, [p(3), rotvec(R)(3), grip], for frames 0..N-2 (so length == per-step `_arm_actions`).
+    The anchored RELATIVE chunk `T_t^-1 T_{t+k}` is built at LOAD time (PikaUmiInputs action_mode=anchored)
+    from the stacked window, anchored at the chunk's first frame -> NO per-step delta integration at deploy
+    (each chunk row composes independently onto the live anchor). rotvec of the absolute orientation is
+    fine to store: the load-time relative computation reconstructs the full rotation. Gripper is the
+    per-frame target opening (absolute/binary); 'delta' gripper is invalid for anchored."""
+    p = pose[:-1, :3]
+    rotvec = Rotation.from_quat(pose[:-1, 3:7]).as_rotvec()
+    if gripper_action == "binary":
+        grip_col = (grip[:-1] >= binary_th).astype(np.float64)[:, None]
+    elif gripper_action == "absolute":
+        grip_col = (grip[:-1] / 100.0)[:, None]
+    else:
+        raise ValueError("anchored action requires --gripper-action absolute or binary (delta is invalid)")
+    return np.concatenate([p, rotvec, grip_col], axis=1).astype(np.float32)
+
+
+def _actions_anchored(left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
+    return np.concatenate(
+        [_arm_actions_anchored(left_pose, left_grip, gripper_action, binary_th),
+         _arm_actions_anchored(right_pose, right_grip, gripper_action, binary_th)],
+        axis=1,
+    ).astype(np.float32)
 
 
 def _arm_actions(pose, grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
@@ -322,6 +374,7 @@ def _episode_frames(
     depth_z_far_mm: float = 700.0,
     depth_units_m: float = 1e-4,
     state_mode: str = "pose",
+    action_mode: str = "delta",
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -363,12 +416,19 @@ def _episode_frames(
             left_depth = L["images/realsense_depth"]
             right_depth = R["images/realsense_depth"]
 
-        # Proprio: 14-D reset-relative pose (default) OR 12-D ee_local velocity (full replacement).
+        # Proprio: pose (14-D reset-relative) | velocity (12-D ee_local) | velocity_grip (14-D vel + abs grip).
         if state_mode == "velocity":
             states = _state_velocity(left_pose, right_pose)
+        elif state_mode == "velocity_grip":
+            states = _state_velocity_grip(left_pose, right_pose, left_grip, right_grip)
         else:
             states = _state(left_pose, right_pose, left_grip, right_grip)
-        actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
+        # Action: per-step ee_local delta (default) | anchored abs-pose-per-frame (UMI-style, relative chunk
+        # built at load).
+        if action_mode == "anchored":
+            actions = _actions_anchored(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
+        else:
+            actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
         if actions.shape[0] != states.shape[0] - 1:
             raise ValueError("length mismatch")
         n_act = actions.shape[0]  # writable frames 0..n_act-1; action[t] spans ts[t]->ts[t+1]
@@ -382,10 +442,15 @@ def _episode_frames(
 
         # Velocity proprio is the INCOMING step (t-1 -> t): bogus across a gap. The first kept frame of a
         # post-gap segment has gap[t-1]=True -> zero its velocity (treat a segment start as zero motion).
-        if state_mode == "velocity":
+        # For velocity_grip, zero ONLY the velocity dims (keep the absolute gripper at 6,13).
+        if state_mode in ("velocity", "velocity_grip"):
             incoming_gap = np.zeros(states.shape[0], dtype=bool)
             incoming_gap[1 : 1 + gap.shape[0]] = gap  # incoming_gap[t] = (step t-1 -> t spanned a gap)
-            states[incoming_gap] = 0.0
+            if state_mode == "velocity_grip":
+                vel_dims = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # exclude gripper dims 6,13
+                states[np.ix_(incoming_gap, vel_dims)] = 0.0
+            else:
+                states[incoming_gap] = 0.0
 
         # Contiguous runs of clean writable frames, broken at gap transitions.
         segments, run = [], []
@@ -443,7 +508,8 @@ def main(
     fisheye_crop_frac: float | None = None,
     tail_pad_frames: int = 0,
     gripper_binary_th: float = 25.0,  # gripper_action=binary: opening >= th -> 1 (open) else 0 (closed/grip)
-    state_mode: str = "pose",  # proprio: "pose" (14-D reset-relative) or "velocity" (12-D ee_local velocity-only)
+    state_mode: str = "pose",  # proprio: "pose"(14-D reset-rel) | "velocity"(12-D) | "velocity_grip"(14-D vel+absGrip)
+    action_mode: str = "delta",  # action: "delta"(per-step ee_local) | "anchored"(UMI-style relative trajectory)
     exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
     include_path_substr: str | None = None,  # keep ONLY episodes whose path contains this (e.g. "onrobot_rgbd")
     # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
@@ -468,9 +534,13 @@ def main(
         raise ValueError("--include-depth requires --camera realsense (RGB-D must be the same aligned view)")
     if include_depth and not (0.0 <= depth_z_near_mm < depth_z_far_mm):
         raise ValueError(f"need 0 <= depth_z_near_mm < depth_z_far_mm, got {depth_z_near_mm}/{depth_z_far_mm}")
-    if state_mode not in ("pose", "velocity"):
-        raise ValueError(f"--state-mode must be 'pose' or 'velocity', got {state_mode!r}")
-    state_dim = 12 if state_mode == "velocity" else 14
+    if state_mode not in ("pose", "velocity", "velocity_grip"):
+        raise ValueError(f"--state-mode must be 'pose', 'velocity', or 'velocity_grip', got {state_mode!r}")
+    if action_mode not in ("delta", "anchored"):
+        raise ValueError(f"--action-mode must be 'delta' or 'anchored', got {action_mode!r}")
+    if action_mode == "anchored" and gripper_action == "delta":
+        raise ValueError("--action-mode anchored requires --gripper-action absolute or binary (delta is invalid)")
+    state_dim = 12 if state_mode == "velocity" else 14  # velocity_grip and pose are both 14-D
     # Center-crop only makes sense for the wide-FOV fisheye; ignore it for realsense so an A/B keeps
     # the realsense arm at full frame.
     crop_frac = fisheye_crop_frac if (camera == "fisheye" and fisheye_crop_frac) else None
@@ -496,6 +566,7 @@ def main(
     print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
     print(
         f"camera={camera} | gripper_action={gripper_action} | state_mode={state_mode} (state_dim={state_dim}) | "
+        f"action_mode={action_mode} | "
         f"crop={'none' if crop_frac is None else f'{crop_frac:g} -> {img_shape[:2]}'} | "
         f"tail_pad_frames={tail_pad_frames} (train only)"
     )
@@ -583,6 +654,7 @@ def main(
                 segments, n_writable = _episode_frames(
                     ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
                     gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m, state_mode,
+                    action_mode,
                 )
                 break
             except Exception as e:
@@ -613,7 +685,7 @@ def main(
         # UNPADDED (honest test). Only the last segment (true episode end), not gap-split boundaries.
         n_pad_added = 0
         if tail_pad_frames > 0 and which == "train" and segments:
-            hf = _make_hold_frame(segments[-1][-1], gripper_action, state_mode)
+            hf = _make_hold_frame(segments[-1][-1], gripper_action, state_mode, action_mode)
             segments[-1].extend(dict(hf) for _ in range(tail_pad_frames))
             n_pad_added = tail_pad_frames
         kept = 0
@@ -644,6 +716,7 @@ def main(
                 "gripper_binary_th": gripper_binary_th if gripper_action == "binary" else None,
                 "state_mode": state_mode,
                 "state_dim": state_dim,
+                "action_mode": action_mode,
                 "val_from_record": str(val_from_record) if val_from_record is not None else None,
                 "exclude_path_substr": exclude_path_substr,
                 "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,

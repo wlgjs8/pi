@@ -88,6 +88,12 @@ def main() -> None:
                              "'absolute' (pred IS the opening /100; reconstruct directly, no integration)")
     parser.add_argument("--horizon", type=int, default=None,
                         help="action horizon; default = the config model's action_horizon")
+    parser.add_argument("--action-mode", type=str, default="delta", choices=["delta", "anchored"],
+                        help="MUST match the dataset's --action-mode. 'delta' = stored per-step ee_local "
+                             "deltas (chunk compared as-is). 'anchored' = dataset stores per-frame ABSOLUTE "
+                             "poses; GT chunk is re-anchored to its first frame (T_t^-1 T_{t+k}) to match the "
+                             "model output. anchored row 0 is structurally identity -> first-step metrics use "
+                             "row 1 (= T_t^-1 T_{t+1}, comparable to a delta run's first step).")
     args = parser.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -122,7 +128,25 @@ def main() -> None:
 
     cfg = _config.get_config(args.config)
     HORIZON = int(args.horizon) if args.horizon else int(cfg.model.action_horizon)
-    print(f"horizon={HORIZON} | gripper_action={args.gripper_action} | config={args.config}")
+
+    ANCHORED = args.action_mode == "anchored"
+    FI = 1 if ANCHORED else 0  # first-step row index (anchored row 0 == identity, so use row 1)
+    if ANCHORED:
+        from openpi.policies.pika_umi_policy import _anchor_relative_chunk
+        # Re-derive the normalizer over the ANCHORED targets (the stored `actions` are abs poses, whose
+        # raw std is the world-frame magnitude -> meaningless). Per-dim std over every window's anchored
+        # rows -> the typical anchored-displacement scale; checkpoint-independent, comparable across runs.
+        _sm = np.zeros(14); _sq = np.zeros(14); _nn = 0
+        for ei in range(n_ep):
+            a, b = int(ep_from[ei]), int(ep_to[ei]); g = actions_all[a : b - 1]
+            for t in range(0, g.shape[0] - HORIZON + 1, args.stride):
+                ch = _anchor_relative_chunk(g[t : t + HORIZON]).astype(np.float64)
+                _sm += ch.sum(0); _sq += (ch ** 2).sum(0); _nn += ch.shape[0]
+        _mean = _sm / max(_nn, 1)
+        action_std = np.sqrt(np.maximum(_sq / max(_nn, 1) - _mean ** 2, 1e-24))
+        scale = float(np.mean(np.square(np.maximum(action_std, 1e-12))))
+        pose_scale = float(np.mean(np.square(np.maximum(action_std[POSE_DIMS], 1e-12))))
+    print(f"horizon={HORIZON} | gripper_action={args.gripper_action} | action_mode={args.action_mode} | config={args.config}")
     policy = _policy_config.create_trained_policy(cfg, str(ckpt_dir))
     if args.n_select > 1:
         from openpi.policies.policy import MedoidPolicy
@@ -186,31 +210,37 @@ def main() -> None:
             pred = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)
             infer_times.append(time.perf_counter() - t0)
             h = min(HORIZON, pred.shape[0], length - t)
-            target = gt[t : t + h]
+            # anchored: build the GT chunk relative to the window's first frame (matches the model output);
+            # delta: the stored per-step deltas are already the chunk.
+            target = _anchor_relative_chunk(gt[t : t + HORIZON])[:h] if ANCHORED else gt[t : t + h]
             err2 = (pred[:h] - target) ** 2
             sq_chunk += float(err2.sum()); n_chunk += err2.size
             for k in range(h):
                 chunk_pos_sq[k] += float(err2[k].sum()); chunk_pos_n[k] += err2[k].size
-            first = err2[0]
-            perdim_sq += err2[0]; perdim_n += 1   # per-dim first-step squared error
+            fi = min(FI, h - 1)  # first MEANINGFUL row (anchored row 0 is identity -> use row 1)
+            first = err2[fi]
+            perdim_sq += err2[fi]; perdim_n += 1   # per-dim first-step squared error
             sq_first += float(first.sum()); n_first += first.size
             pose_sq += float(first[POSE_DIMS].sum()); pose_n += len(POSE_DIMS)
             phase = bounds.phase_for_frame(t)
             phase_sq[phase] += float(first.sum()); phase_n[phase] += first.size
             if phase == "right_pick":
-                ep_dz["right"] += float(pred[0][9] - gt[t][9])
+                ep_dz["right"] += float(pred[fi][9] - target[fi][9])
             elif phase == "left_pick":
-                ep_dz["left"] += float(pred[0][2] - gt[t][2])
+                ep_dz["left"] += float(pred[fi][2] - target[fi][2])
             sf.append(t)
-            pdg["left"].append(float(pred[0][GRIP_DIMS[0]]))
-            pdg["right"].append(float(pred[0][GRIP_DIMS[1]]))
+            pdg["left"].append(float(pred[fi][GRIP_DIMS[0]]))
+            pdg["right"].append(float(pred[fi][GRIP_DIMS[1]]))
             grip_dmse_sq += float(first[GRIP_DIMS[0]] + first[GRIP_DIMS[1]]); grip_dmse_n += 2
             frame_count += 1
 
         if bounds.clean:
             intz["right"].append(abs(ep_dz["right"]) * args.stride * 1000.0)
             intz["left"].append(abs(ep_dz["left"]) * args.stride * 1000.0)
-            for arm, (xi, yi, zi, bkey) in GRASP.items():
+            # grasp-instant-error uses the row-0 action vs the per-frame GT; for anchored, row 0 is
+            # identity and the stored GT is an absolute pose -> not comparable, so skip (N/A). The
+            # headline per-axis / per-chunk / pose-only nMSE carry the A/B signal.
+            for arm, (xi, yi, zi, bkey) in (GRASP.items() if not ANCHORED else ()):
                 ef = int(getattr(bounds, bkey))
                 if not (0 <= ef < length):
                     continue
@@ -257,6 +287,8 @@ def main() -> None:
         "checkpoint_step": args.checkpoint_step,
         "config": args.config,
         "gripper_action": args.gripper_action,
+        "action_mode": args.action_mode,
+        "first_step_row": FI,  # anchored: 1 (row 0 is identity); delta: 0
         "ckpt_base": args.ckpt_base,
         "val_repo_id": args.val_repo_id,
         "n_select": args.n_select,

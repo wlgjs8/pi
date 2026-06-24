@@ -2,9 +2,31 @@ import dataclasses
 
 import einops
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from openpi import transforms
 from openpi.models import model as _model
+
+
+def _anchor_relative_chunk(actions: np.ndarray) -> np.ndarray:
+    """UMI-style anchored relative trajectory (load-time, action_mode='anchored').
+
+    `actions` is the (H, 14) chunk the loader stacked from the dataset, where each row is the per-frame
+    tool-frame ABSOLUTE pose `[L p3, L rotvec3, L grip, R p3, R rotvec3, R grip]` (the converter stored
+    abs poses for action_mode=anchored). Re-express every row RELATIVE to the chunk's first frame (the
+    anchor T_t): `pos_k = R0^-1 (p_k - p0)`, `rot_k = rotvec(R0^-1 R_k)`; gripper passes through. Row 0 is
+    thus ~identity. This is invariant to any global rigid transform (like ee_local), and at deploy each row
+    composes INDEPENDENTLY onto the live anchor -> no per-step delta integration / drift."""
+    a = np.asarray(actions, dtype=np.float64)
+    out = a.copy()
+    for base in (0, 7):  # left arm cols 0:7, right arm cols 7:14
+        p = a[:, base : base + 3]
+        R = Rotation.from_rotvec(a[:, base + 3 : base + 6])
+        r0_inv = R[0].inv()
+        out[:, base : base + 3] = r0_inv.apply(p - p[0])
+        out[:, base + 3 : base + 6] = (r0_inv * R).as_rotvec()
+        # gripper col (base+6) unchanged -- it is the per-frame target opening
+    return out.astype(np.float32)
 
 
 def _parse_image(image) -> np.ndarray:
@@ -28,6 +50,11 @@ class PikaUmiInputs(transforms.DataTransformFn):
     # NOT ego-centric -> a frame-inconsistent channel. Dropping it forces a purely vision-driven
     # (genuinely ego-centric wrist-cam) policy. Matches the .8 baseline (zero_state=True).
     zero_state: bool = False
+    # Action representation. "delta" = per-step ee_local delta (default; chunk = independent 1-step deltas,
+    # integrated/accumulated at deploy). "anchored" = UMI relative trajectory: the dataset stores per-frame
+    # ABSOLUTE poses; here we re-express the chunk relative to its first frame -> each row composes onto the
+    # live anchor at deploy with NO integration. MUST match the converter's --action-mode.
+    action_mode: str = "delta"
 
     def __call__(self, data: dict) -> dict:
         left_wrist = _parse_image(data["observation/left_wrist_0_rgb"])
@@ -61,7 +88,10 @@ class PikaUmiInputs(transforms.DataTransformFn):
         }
 
         if "actions" in data:
-            inputs["actions"] = data["actions"]
+            acts = data["actions"]
+            if self.action_mode == "anchored":
+                acts = _anchor_relative_chunk(acts)  # abs-pose chunk -> anchored relative trajectory
+            inputs["actions"] = acts
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
