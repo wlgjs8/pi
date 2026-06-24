@@ -22,6 +22,12 @@ class PikaUmiInputs(transforms.DataTransformFn):
     # If true, also feed the RealSense depth (pre-encoded as a normalized 3-channel
     # image by the converter) as extra `*_wrist_0_depth` camera inputs (RGB-D).
     include_depth: bool = False
+    # If true, NEUTRALIZE proprio: zero the state so its discrete State: tokens become a
+    # constant (carries no pose info). UMI handheld init pose is arbitrarily rotated per
+    # episode, so reset-relative proprio is anchored to a per-episode-rotated t0 frame and is
+    # NOT ego-centric -> a frame-inconsistent channel. Dropping it forces a purely vision-driven
+    # (genuinely ego-centric wrist-cam) policy. Matches the .8 baseline (zero_state=True).
+    zero_state: bool = False
 
     def __call__(self, data: dict) -> dict:
         left_wrist = _parse_image(data["observation/left_wrist_0_rgb"])
@@ -44,8 +50,12 @@ class PikaUmiInputs(transforms.DataTransformFn):
             image_mask["left_wrist_0_depth"] = np.True_
             image_mask["right_wrist_0_depth"] = np.True_
 
+        state = data["observation/state"]
+        if self.zero_state:
+            state = np.zeros_like(state)  # proprio neutralized -> constant State: tokens, no pose info
+
         inputs = {
-            "state": data["observation/state"],
+            "state": state,
             "image": images,
             "image_mask": image_mask,
         }

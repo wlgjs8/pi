@@ -131,6 +131,7 @@ def main() -> None:
 
     sq_first, n_first = 0.0, 0.0
     pose_sq, pose_n = 0.0, 0.0  # first-step POSE-only (12-dim, gripper excluded) MSE
+    perdim_sq = np.zeros(14); perdim_n = 0  # per-dimension first-step squared error (raw units^2)
     sq_chunk, n_chunk = 0.0, 0.0
     chunk_pos_sq = [0.0] * HORIZON  # normalized action MSE per chunk position (step 0..H-1)
     chunk_pos_n = [0] * HORIZON
@@ -155,8 +156,15 @@ def main() -> None:
         # full-episode per-frame actions: GT[t] is the ee_local delta from t->t+1 (last frame has none)
         gt = actions_all[a:b - 1]  # (T-1, 14)
         length = gt.shape[0]
-        left_grip = states[:, GRIP_DIMS[0]] * 100.0   # absolute % for phase events
-        right_grip = states[:, GRIP_DIMS[1]] * 100.0
+        # Obs gripper opening for phase events lives at state dims 6/13 in the 14-D pose proprio.
+        # The velocity-only proprio (state_mode=velocity) is 12-D and carries NO gripper -> zero it,
+        # which makes phase boundaries "not clean" and skips the gripper-timing/grasp/phase-MSE blocks.
+        # The headline action MSE (first-step / pose-only / per-chunk) is independent of obs gripper.
+        if states.shape[1] > max(GRIP_DIMS):
+            left_grip = states[:, GRIP_DIMS[0]] * 100.0   # absolute % for phase events
+            right_grip = states[:, GRIP_DIMS[1]] * 100.0
+        else:
+            left_grip = np.zeros(states.shape[0]); right_grip = np.zeros(states.shape[0])
         bounds = phase_mod.extract_phase_boundaries(left_grip, right_grip, length)
 
         left_mp4 = root / "videos/chunk-000/left_wrist_0_rgb" / f"episode_{ei:06d}.mp4"
@@ -184,6 +192,7 @@ def main() -> None:
             for k in range(h):
                 chunk_pos_sq[k] += float(err2[k].sum()); chunk_pos_n[k] += err2[k].size
             first = err2[0]
+            perdim_sq += err2[0]; perdim_n += 1   # per-dim first-step squared error
             sq_first += float(first.sum()); n_first += first.size
             pose_sq += float(first[POSE_DIMS].sum()); pose_n += len(POSE_DIMS)
             phase = bounds.phase_for_frame(t)
@@ -264,6 +273,29 @@ def main() -> None:
             "action_mse": sq_first / max(n_first, 1.0),
             "normalized_action_mse": (sq_first / max(n_first, 1.0)) / scale,
         },
+        "per_axis_first_step": {
+            # Per-dimension first-step error. RMSE in physical units (translation mm, rotation deg);
+            # normalized = per-dim MSE / per-dim GT variance (1.0 == mean-predictor baseline, the worst
+            # meaningful value). gripper dims (6,13) reported in /100 RMSE.
+            arm: {
+                ax: {
+                    "rmse": (
+                        float(np.sqrt(perdim_sq[di] / max(perdim_n, 1)) * (1000.0 if ax in ("x", "y", "z")
+                                else (180.0 / np.pi) if ax in ("rx", "ry", "rz") else 1.0)),
+                        ("mm" if ax in ("x", "y", "z") else "deg" if ax in ("rx", "ry", "rz") else "/100")
+                    )[0],
+                    "unit": ("mm" if ax in ("x", "y", "z") else "deg" if ax in ("rx", "ry", "rz") else "frac"),
+                    "normalized_mse": float((perdim_sq[di] / max(perdim_n, 1)) / max(action_std[di] ** 2, 1e-24)),
+                }
+                for ax, di in axmap.items()
+            }
+            for arm, axmap in {
+                "left":  {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5, "grip": 6},
+                "right": {"x": 7, "y": 8, "z": 9, "rx": 10, "ry": 11, "rz": 12, "grip": 13},
+            }.items()
+        },
+        "per_axis_note": "first-step per-dim error; rmse is per 30Hz step (translation mm, rotation deg); "
+                         "normalized_mse=MSE/var, 1.0==predicting the mean (worst meaningful)",
         "first_step_pose_only_12dim": {
             "action_mse": pose_sq / max(pose_n, 1.0),
             "normalized_action_mse": (pose_sq / max(pose_n, 1.0)) / pose_scale,

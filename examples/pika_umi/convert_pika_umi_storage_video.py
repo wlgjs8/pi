@@ -69,6 +69,39 @@ def _crop_shape(frac: float | None, base=(480, 640)) -> tuple[int, int, int]:
     return (int(round(h * frac)), int(round(w * frac)), 3)
 
 
+# --- depth (Option A: depth as an extra image stream through the SHARED SigLIP) ---
+# DEPLOY CONTRACT: policy_runner OpenpiRemoteActionSource MUST apply a BIT-IDENTICAL
+# _depth_to_image (same z_near/z_far, hole=far, 3ch replicate) to the live D405 depth and
+# send observation/{left,right}_wrist_0_depth — else the depth channel is OOD at inference.
+def _decode_depth(encoded: np.ndarray) -> np.ndarray:
+    """Decode a 16-bit RealSense depth frame (millimetres) to a uint16 HxW array."""
+    depth = cv2.imdecode(np.asarray(encoded, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        raise ValueError("Failed to decode depth frame")
+    return depth
+
+
+def _depth_to_image(
+    depth_raw: np.ndarray, z_near_mm: float = 120.0, z_far_mm: float = 700.0, depth_units_m: float = 1e-4
+) -> np.ndarray:
+    """Normalize metric depth -> 3-channel uint8 image for the SigLIP encoder.
+
+    `depth_raw` is the stored uint16 where each count = `depth_units_m` metres. The Pika D405
+    collect config uses **100 µm = 1e-4 m** (verify in the session `collect.log`:
+    `depth_units=...`) -> a count of 3075 is 307.5 mm, NOT 3075 mm. We convert to mm, then clip
+    to the [z_near, z_far] grasp working volume (near->0, far->255), treat invalid (hole,
+    depth==0) pixels as far, and grayscale-replicate to 3 channels (monotonic metric ordering).
+    ⚠ The live-deploy depth (policy_runner) MUST use the SAME depth_units_m + z_near/z_far.
+    NOTE: video-backed (h264) is lossy but depth is already 8-bit-quantized here -> fine for
+    coarse geometric grounding; switch the depth feature to dtype 'image' (png) if precision matters."""
+    valid = depth_raw > 0
+    d_mm = depth_raw.astype(np.float32) * (depth_units_m * 1000.0)
+    d = np.clip((d_mm - z_near_mm) / (z_far_mm - z_near_mm), 0.0, 1.0)
+    d[~valid] = 1.0
+    g = (d * 255.0).astype(np.uint8)
+    return np.repeat(g[..., None], 3, axis=2)
+
+
 def _make_hold_frame(last_frame: dict, gripper_action: str) -> dict:
     """A frozen 'hold' frame: last image + state held, action = stay-put (zero pose delta; gripper stays
     at its current opening). Appended to an episode's FINAL segment to extend the short post-release tail
@@ -80,13 +113,17 @@ def _make_hold_frame(last_frame: dict, gripper_action: str) -> dict:
         hold[6] = last_frame["state"][6]
         hold[13] = last_frame["state"][13]
     # delta mode: zero gripper delta == hold (leave hold[6]/[13] at 0)
-    return {
+    out = {
         "left_wrist_0_rgb": last_frame["left_wrist_0_rgb"],
         "right_wrist_0_rgb": last_frame["right_wrist_0_rgb"],
         "state": last_frame["state"],
         "actions": hold,
         "task": PROMPT,
     }
+    for k in ("left_wrist_0_depth", "right_wrist_0_depth"):  # carry depth through the hold tail
+        if k in last_frame:
+            out[k] = last_frame[k]
+    return out
 
 
 _IDENT_POSE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
@@ -206,7 +243,12 @@ def _find_episodes(data_root: pathlib.Path) -> list[pathlib.Path]:
     return eps
 
 
-def _make_dataset(repo_id: str, root: pathlib.Path, img_shape: tuple[int, int, int] = (480, 640, 3)):
+def _make_dataset(
+    repo_id: str,
+    root: pathlib.Path,
+    img_shape: tuple[int, int, int] = (480, 640, 3),
+    include_depth: bool = False,
+):
     import shutil
 
     if root.exists():
@@ -218,6 +260,11 @@ def _make_dataset(repo_id: str, root: pathlib.Path, img_shape: tuple[int, int, i
         "state": {"dtype": "float32", "shape": (14,), "names": ["state"]},
         "actions": {"dtype": "float32", "shape": (14,), "names": ["actions"]},
     }
+    if include_depth:
+        # Depth is a separate image stream through the SAME SigLIP (PikaUmiInputs include_depth);
+        # realsense-only (480x640) so it shares img_shape (depth requires --camera realsense).
+        features["left_wrist_0_depth"] = _img_feat
+        features["right_wrist_0_depth"] = _img_feat
     return LeRobotDataset.create(
         repo_id=repo_id,
         root=root,
@@ -243,6 +290,10 @@ def _episode_frames(
     crop_frac: float | None,
     gripper_action: str,
     binary_th: float = 25.0,
+    include_depth: bool = False,
+    depth_z_near_mm: float = 120.0,
+    depth_z_far_mm: float = 700.0,
+    depth_units_m: float = 1e-4,
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -277,6 +328,12 @@ def _episode_frames(
         # left/right_wrist_0_rgb so an existing config trains on the swapped images unchanged.
         left_images = L[f"images/{camera}_color"]
         right_images = R[f"images/{camera}_color"]
+        # Depth is ALWAYS the realsense stream (RGB-D aligned), regardless of the color camera;
+        # require --camera realsense at the CLI so RGB and depth are the same (aligned) view.
+        left_depth = right_depth = None
+        if include_depth:
+            left_depth = L["images/realsense_depth"]
+            right_depth = R["images/realsense_depth"]
 
         states = _state(left_pose, right_pose, left_grip, right_grip)
         actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
@@ -304,19 +361,24 @@ def _episode_frames(
             segments.append(run)
         segments = [s for s in segments if len(s) >= min_seg_frames]
 
-        out = [
-            [
-                {
-                    "left_wrist_0_rgb": _decode_color(left_images[t], crop_frac),
-                    "right_wrist_0_rgb": _decode_color(right_images[t], crop_frac),
-                    "state": states[t],
-                    "actions": actions[t],
-                    "task": PROMPT,
-                }
-                for t in seg
-            ]
-            for seg in segments
-        ]
+        def _frame(t):
+            fr = {
+                "left_wrist_0_rgb": _decode_color(left_images[t], crop_frac),
+                "right_wrist_0_rgb": _decode_color(right_images[t], crop_frac),
+                "state": states[t],
+                "actions": actions[t],
+                "task": PROMPT,
+            }
+            if include_depth:
+                fr["left_wrist_0_depth"] = _depth_to_image(
+                    _decode_depth(left_depth[t]), depth_z_near_mm, depth_z_far_mm, depth_units_m
+                )
+                fr["right_wrist_0_depth"] = _depth_to_image(
+                    _decode_depth(right_depth[t]), depth_z_near_mm, depth_z_far_mm, depth_units_m
+                )
+            return fr
+
+        out = [[_frame(t) for t in seg] for seg in segments]
         return out, n_act
 
 
@@ -347,6 +409,12 @@ def main(
     # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
     # (Unlike --split-in, which reproduces the EXACT split and DROPS episodes not in train|val.)
     val_from_record: pathlib.Path | None = None,
+    # Depth (Option A): add the realsense depth as extra wrist images (-> shared SigLIP, PikaUmiInputs
+    # include_depth=True). z_near/z_far define the [near->0, far->255] mm clip; tune to wrist->bolt range.
+    include_depth: bool = False,
+    depth_z_near_mm: float = 120.0,
+    depth_z_far_mm: float = 700.0,
+    depth_units_m: float = 1e-4,  # stored-depth count -> metres (Pika D405: 100µm; check collect.log)
 ):
     import functools
     import json
@@ -356,6 +424,10 @@ def main(
         raise ValueError(f"--camera must be 'realsense' or 'fisheye', got {camera!r}")
     if gripper_action not in ("delta", "absolute", "binary"):
         raise ValueError(f"--gripper-action must be 'delta', 'absolute', or 'binary', got {gripper_action!r}")
+    if include_depth and camera != "realsense":
+        raise ValueError("--include-depth requires --camera realsense (RGB-D must be the same aligned view)")
+    if include_depth and not (0.0 <= depth_z_near_mm < depth_z_far_mm):
+        raise ValueError(f"need 0 <= depth_z_near_mm < depth_z_far_mm, got {depth_z_near_mm}/{depth_z_far_mm}")
     # Center-crop only makes sense for the wide-FOV fisheye; ignore it for realsense so an A/B keeps
     # the realsense arm at full frame.
     crop_frac = fisheye_crop_frac if (camera == "fisheye" and fisheye_crop_frac) else None
@@ -383,6 +455,10 @@ def main(
         f"camera={camera} | gripper_action={gripper_action} | "
         f"crop={'none' if crop_frac is None else f'{crop_frac:g} -> {img_shape[:2]}'} | "
         f"tail_pad_frames={tail_pad_frames} (train only)"
+    )
+    print(
+        f"depth: {'ON' if include_depth else 'off'}"
+        + (f" (realsense_depth -> *_wrist_0_depth, clip [{depth_z_near_mm:.0f},{depth_z_far_mm:.0f}]mm)" if include_depth else "")
     )
 
     episodes = _find_episodes(data_root)
@@ -441,8 +517,8 @@ def main(
         val_idx = set(order[:n_val].tolist())
         print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val (camera={camera})")
 
-    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape)
-    val_ds = _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape) if n_val > 0 else None
+    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth)
+    val_ds = _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth) if n_val > 0 else None
 
     counts = {"train": [0, 0], "val": [0, 0]}  # [segments(=lerobot episodes), frames]
     skipped = []
@@ -459,7 +535,8 @@ def main(
         for attempt in range(4):
             try:
                 segments, n_writable = _episode_frames(
-                    ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action, gripper_binary_th
+                    ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
+                    gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m
                 )
                 break
             except Exception as e:
@@ -524,6 +601,10 @@ def main(
                 "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,
                 "tail_pad_frames": tail_pad_frames,
                 "img_shape": list(img_shape),
+                "include_depth": include_depth,
+                "depth_z_near_mm": depth_z_near_mm if include_depth else None,
+                "depth_z_far_mm": depth_z_far_mm if include_depth else None,
+                "depth_units_m": depth_units_m if include_depth else None,
                 "pose_frame": "tcp_tip" if tool_offset is not None else "raw_tracker_steamvr_world",
                 "retarget_config": str(retarget_config) if tool_offset is not None else None,
                 "gap_threshold_s": gap_threshold_s,

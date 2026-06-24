@@ -478,6 +478,10 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # If set, center-crop each image to (center_crop, center_crop) instead of the default
     # aspect-preserving resize_with_pad — higher effective resolution on the central object.
     center_crop: int | None = None
+    # If true, neutralize proprio (zero the state -> constant State: tokens) so the policy is
+    # purely vision-driven. UMI per-episode-rotated init pose makes reset-relative proprio
+    # non-ego-centric; dropping it removes that frame-inconsistent channel. Matches .8 baseline.
+    zero_state: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -492,7 +496,7 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             repack_map["observation/left_wrist_0_depth"] = "left_wrist_0_depth"
             repack_map["observation/right_wrist_0_depth"] = "right_wrist_0_depth"
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
-        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth)]
+        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state)]
         if self.center_crop is not None:
             data_input_transforms.append(_transforms.CenterCropImages(self.center_crop, self.center_crop))
         data_transforms = _transforms.Group(
@@ -1352,6 +1356,83 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # DEPTH (Option A): IDENTICAL to ..._binary_h50 (same binary gripper @25, ee_local action,
+    # action_horizon=50) but with RGB-D — the realsense depth is added as extra wrist images
+    # (include_depth=True -> *_wrist_0_depth through the SAME SigLIP, PikaUmiInputs). Needs its OWN
+    # depth-converted dataset (storage converter `--include-depth --camera realsense`, default
+    # z_near/z_far 120/700 mm, depth_units 1e-4) + its own assets_dir (norm-stats differ: more image
+    # streams). Deploy: policy_runner must send the matching live D405 *_wrist_0_depth (same
+    # _depth_to_image). To pair with velocity-proprio, merge with `--state-mode velocity` + the
+    # velproprio dataset (the two are orthogonal: state-rep vs image-streams). Targets the
+    # nostate↔depth coupling (wiki nonllm-rgbd-flow-aug / vla-rollout-diagnosis).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_binary_h50_depth",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_binary_h50_depth",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_depth"),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO-FREE h24: IDENTICAL to ..._binary_h50 baseline (same binary_h50 dataset, same
+    # action_dim=32, zero_state=True) EXCEPT action_horizon 50->24. A/B isolates the chunk-commitment
+    # horizon under the proprio-neutralized regime (.8 runs the h50 baseline; this is the .13 h24 arm).
+    # zero_state matches .8: UMI per-episode-rotated init pose makes reset-relative proprio non-ego-
+    # centric, so the State: channel is dropped -> purely vision-driven (genuinely ego-centric wrist cams).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_binary_h24_nostate",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h24_nostate"),
+            zero_state=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO-FREE h50 baseline (the .8 arm): IDENTICAL to ..._binary_h50 (same binary_h50 dataset,
+    # same assets_dir -> reuses its norm_stats, no recompute; zeroing is pre-Normalize) + zero_state=True.
+    # action_horizon=50. Mirrors the 8.8-committed config so the deploy PC can serve binary_h50_nostate.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_binary_h50_nostate",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
+            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50"),
+            zero_state=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     # DART experiment: IDENTICAL to ..._binary_h50 (same dataset, no re-conversion) + train-only
     # DART-style recovery-noise augmentation (covariate-shift / compounding-error). Targets the
     # 2026-06-22 diagnosis (teacher-forced OK, rollout 50/50 approach = closed-loop §5). Reuses the
@@ -1370,6 +1451,35 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # VELOCITY-PROPRIO ablation (this PC, 8x RTX PRO 6000): IDENTICAL to ..._binary_h50 (binary gripper @th25,
+    # action ee_local delta, action_horizon=50, 40k) EXCEPT the proprio `observation/state` is fully replaced
+    # by a 12-D ee_local VELOCITY (per arm [pos_vel_local(3), rot_vel(3)]; no pose, no gripper) -- the
+    # converter's --state-mode velocity. Pairs with the other server's "no proprio at all" run as a clean
+    # ablation on what proprioception buys (none vs velocity-only). Needs its OWN dataset (12-D state) +
+    # norm-stats; PikaUmiInputs passes state through and the model pads 12->32, so no model/transform change.
+    # Deploy NOTE: the runtime proprio (policy_runner OpenpiRemoteActionSource._proprio_state) must emit the
+    # matching 12-D ee_local velocity, not reset-relative pose, to match this training distribution.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_binary_h50_velproprio",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_binary_h50_velproprio",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_velproprio"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
