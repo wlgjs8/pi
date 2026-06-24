@@ -102,21 +102,25 @@ def _depth_to_image(
     return np.repeat(g[..., None], 3, axis=2)
 
 
-def _make_hold_frame(last_frame: dict, gripper_action: str) -> dict:
+def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "pose") -> dict:
     """A frozen 'hold' frame: last image + state held, action = stay-put (zero pose delta; gripper stays
     at its current opening). Appended to an episode's FINAL segment to extend the short post-release tail
-    (see the tail-pad rationale at the write loop). State layout is 14-D
-    [L pos3, L rot3, L grip(6), R pos3, R rot3, R grip(13)]; action shares the layout."""
+    (see the tail-pad rationale at the write loop). Action layout is 14-D
+    [L pos3, L rot3, L grip(6), R pos3, R rot3, R grip(13)].
+    State layout depends on state_mode: pose -> 14-D reset-relative pose (held); velocity -> 12-D ee_local
+    velocity, which for a stay-put hold is ZERO (no motion), not the last frame's velocity."""
     hold = np.zeros(14, dtype=np.float32)
     if gripper_action == "absolute":
         # absolute action gripper = next-step opening; holding means keep the current (open) opening
         hold[6] = last_frame["state"][6]
         hold[13] = last_frame["state"][13]
     # delta mode: zero gripper delta == hold (leave hold[6]/[13] at 0)
+    # velocity proprio: a stay-put hold has zero velocity; pose proprio: hold the last pose.
+    hold_state = np.zeros_like(last_frame["state"]) if state_mode == "velocity" else last_frame["state"]
     out = {
         "left_wrist_0_rgb": last_frame["left_wrist_0_rgb"],
         "right_wrist_0_rgb": last_frame["right_wrist_0_rgb"],
-        "state": last_frame["state"],
+        "state": hold_state,
         "actions": hold,
         "task": PROMPT,
     }
@@ -172,6 +176,28 @@ def _state(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
         ],
         axis=1,
     ).astype(np.float32)
+
+
+def _arm_velocity(pose) -> np.ndarray:
+    """Per-frame ee_local VELOCITY: vel[t] = the previous executed step (t-1 -> t), in frame[t-1]'s
+    body frame (the SAME ee_local representation as the action's pose delta, just shifted one step so
+    it is the *incoming* motion, i.e. causal proprio). vel[0] = 0 (no prior motion at the segment start).
+    Body-frame (not world) so it is invariant to the unmeasured steamvr->stand transform, exactly like
+    the ee_local action (wiki umi-tcp-delta-frame)."""
+    cur = Rotation.from_quat(pose[:-1, 3:7])  # frame[t-1] = the 'from'
+    nxt = Rotation.from_quat(pose[1:, 3:7])  # frame[t]   = the 'to'
+    pos_delta_local = cur.inv().apply(pose[1:, :3] - pose[:-1, :3])  # (N-1,3) in frame[t-1]
+    rot_delta = (cur.inv() * nxt).as_rotvec()  # (N-1,3)
+    step = np.concatenate([pos_delta_local, rot_delta], axis=1)  # (N-1,6) = vel AT frames 1..N-1
+    return np.vstack([np.zeros((1, 6)), step]).astype(np.float32)  # (N,6); vel[0]=0
+
+
+def _state_velocity(left_pose, right_pose) -> np.ndarray:
+    """VELOCITY-ONLY proprio (12-D): per arm [pos_vel_local(3), rot_vel(3)]. Fully replaces the 14-D
+    reset-relative pose state (no absolute/relative pose, no gripper) -- the proprio carries only how the
+    EE is currently moving. Gripper proprio is intentionally dropped (the action still predicts the
+    binary gripper). Across a frame-time gap the incoming step is bogus; the caller zeros those rows."""
+    return np.concatenate([_arm_velocity(left_pose), _arm_velocity(right_pose)], axis=1).astype(np.float32)
 
 
 def _arm_actions(pose, grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
@@ -248,6 +274,7 @@ def _make_dataset(
     root: pathlib.Path,
     img_shape: tuple[int, int, int] = (480, 640, 3),
     include_depth: bool = False,
+    state_dim: int = 14,
 ):
     import shutil
 
@@ -257,7 +284,7 @@ def _make_dataset(
     features = {
         "left_wrist_0_rgb": _img_feat,
         "right_wrist_0_rgb": _img_feat,
-        "state": {"dtype": "float32", "shape": (14,), "names": ["state"]},
+        "state": {"dtype": "float32", "shape": (state_dim,), "names": ["state"]},
         "actions": {"dtype": "float32", "shape": (14,), "names": ["actions"]},
     }
     if include_depth:
@@ -294,6 +321,7 @@ def _episode_frames(
     depth_z_near_mm: float = 120.0,
     depth_z_far_mm: float = 700.0,
     depth_units_m: float = 1e-4,
+    state_mode: str = "pose",
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -335,7 +363,11 @@ def _episode_frames(
             left_depth = L["images/realsense_depth"]
             right_depth = R["images/realsense_depth"]
 
-        states = _state(left_pose, right_pose, left_grip, right_grip)
+        # Proprio: 14-D reset-relative pose (default) OR 12-D ee_local velocity (full replacement).
+        if state_mode == "velocity":
+            states = _state_velocity(left_pose, right_pose)
+        else:
+            states = _state(left_pose, right_pose, left_grip, right_grip)
         actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
         if actions.shape[0] != states.shape[0] - 1:
             raise ValueError("length mismatch")
@@ -347,6 +379,13 @@ def _episode_frames(
             gap = np.diff(ts)[:n_act] > gap_threshold_s
         except Exception:
             gap = np.zeros(n_act, dtype=bool)
+
+        # Velocity proprio is the INCOMING step (t-1 -> t): bogus across a gap. The first kept frame of a
+        # post-gap segment has gap[t-1]=True -> zero its velocity (treat a segment start as zero motion).
+        if state_mode == "velocity":
+            incoming_gap = np.zeros(states.shape[0], dtype=bool)
+            incoming_gap[1 : 1 + gap.shape[0]] = gap  # incoming_gap[t] = (step t-1 -> t spanned a gap)
+            states[incoming_gap] = 0.0
 
         # Contiguous runs of clean writable frames, broken at gap transitions.
         segments, run = [], []
@@ -404,6 +443,7 @@ def main(
     fisheye_crop_frac: float | None = None,
     tail_pad_frames: int = 0,
     gripper_binary_th: float = 25.0,  # gripper_action=binary: opening >= th -> 1 (open) else 0 (closed/grip)
+    state_mode: str = "pose",  # proprio: "pose" (14-D reset-relative) or "velocity" (12-D ee_local velocity-only)
     exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
     include_path_substr: str | None = None,  # keep ONLY episodes whose path contains this (e.g. "onrobot_rgbd")
     # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
@@ -428,6 +468,9 @@ def main(
         raise ValueError("--include-depth requires --camera realsense (RGB-D must be the same aligned view)")
     if include_depth and not (0.0 <= depth_z_near_mm < depth_z_far_mm):
         raise ValueError(f"need 0 <= depth_z_near_mm < depth_z_far_mm, got {depth_z_near_mm}/{depth_z_far_mm}")
+    if state_mode not in ("pose", "velocity"):
+        raise ValueError(f"--state-mode must be 'pose' or 'velocity', got {state_mode!r}")
+    state_dim = 12 if state_mode == "velocity" else 14
     # Center-crop only makes sense for the wide-FOV fisheye; ignore it for realsense so an A/B keeps
     # the realsense arm at full frame.
     crop_frac = fisheye_crop_frac if (camera == "fisheye" and fisheye_crop_frac) else None
@@ -452,7 +495,7 @@ def main(
         print("pose frame: raw tracker (steamvr_world, NO tool offset) -- legacy *_8020 behavior")
     print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
     print(
-        f"camera={camera} | gripper_action={gripper_action} | "
+        f"camera={camera} | gripper_action={gripper_action} | state_mode={state_mode} (state_dim={state_dim}) | "
         f"crop={'none' if crop_frac is None else f'{crop_frac:g} -> {img_shape[:2]}'} | "
         f"tail_pad_frames={tail_pad_frames} (train only)"
     )
@@ -517,8 +560,11 @@ def main(
         val_idx = set(order[:n_val].tolist())
         print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val (camera={camera})")
 
-    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth)
-    val_ds = _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth) if n_val > 0 else None
+    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth, state_dim)
+    val_ds = (
+        _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth, state_dim)
+        if n_val > 0 else None
+    )
 
     counts = {"train": [0, 0], "val": [0, 0]}  # [segments(=lerobot episodes), frames]
     skipped = []
@@ -536,7 +582,7 @@ def main(
             try:
                 segments, n_writable = _episode_frames(
                     ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
-                    gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m
+                    gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m, state_mode,
                 )
                 break
             except Exception as e:
@@ -567,7 +613,7 @@ def main(
         # UNPADDED (honest test). Only the last segment (true episode end), not gap-split boundaries.
         n_pad_added = 0
         if tail_pad_frames > 0 and which == "train" and segments:
-            hf = _make_hold_frame(segments[-1][-1], gripper_action)
+            hf = _make_hold_frame(segments[-1][-1], gripper_action, state_mode)
             segments[-1].extend(dict(hf) for _ in range(tail_pad_frames))
             n_pad_added = tail_pad_frames
         kept = 0
@@ -596,6 +642,8 @@ def main(
                 "split_in": str(split_in) if split_in is not None else None,
                 "gripper_action": gripper_action,
                 "gripper_binary_th": gripper_binary_th if gripper_action == "binary" else None,
+                "state_mode": state_mode,
+                "state_dim": state_dim,
                 "val_from_record": str(val_from_record) if val_from_record is not None else None,
                 "exclude_path_substr": exclude_path_substr,
                 "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,
