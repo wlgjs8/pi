@@ -489,6 +489,13 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # keeps full FOV and spends the whole 224x224 on the scene (more pixels on small bolts). The served
     # config carries this, so train/serve resize stay matched. (center_crop, if set, takes precedence.)
     resize_pad: bool = True
+    # Action representation; MUST match the dataset's converter --action-mode. "delta" = per-step ee_local
+    # delta (default). "anchored" = UMI relative trajectory (dataset stores abs poses; PikaUmiInputs
+    # re-anchors the chunk to its first frame -> no deploy-time integration drift).
+    action_mode: str = "delta"
+    # Arm scope; MUST match the dataset's converter --arm. "dual" = 14-D both arms (default). "right" =
+    # 7-D right-arm-only (single-arm policy; the model output is sliced to 7).
+    arm: str = "dual"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -503,12 +510,12 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             repack_map["observation/left_wrist_0_depth"] = "left_wrist_0_depth"
             repack_map["observation/right_wrist_0_depth"] = "right_wrist_0_depth"
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
-        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state)]
+        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state, action_mode=self.action_mode)]
         if self.center_crop is not None:
             data_input_transforms.append(_transforms.CenterCropImages(self.center_crop, self.center_crop))
         data_transforms = _transforms.Group(
             inputs=data_input_transforms,
-            outputs=[pika_umi_policy.PikaUmiOutputs()],
+            outputs=[pika_umi_policy.PikaUmiOutputs(action_dim=7 if self.arm == "right" else 14)],
         )
         model_transforms = ModelTransformFactory(resize_pad=self.resize_pad)(model_config)
 
@@ -1483,6 +1490,62 @@ _CONFIGS = [
             assets=AssetsConfig(
                 assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_velproprio"
             ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # UMI-STYLE ANCHORED action A/B (vs the per-step-delta velproprio above). action_mode=anchored: the
+    # dataset stores per-frame ABSOLUTE tool poses and PikaUmiInputs re-expresses each H=24 chunk relative
+    # to its first frame (T_t^-1 T_{t+k}) -> at deploy each row composes INDEPENDENTLY onto the live anchor
+    # (no per-step delta integration / within-chunk drift, the suspected rollout-grasp failure). proprio =
+    # velocity_grip (14-D ee_local velocity + ABSOLUTE gripper, init-pose-independent); action gripper =
+    # absolute. Needs its OWN dataset (--action-mode anchored --state-mode velocity_grip --gripper-action
+    # absolute) + norm-stats. action_horizon=24.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_anchored_velgrip_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_anchored_velgrip_h24",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_anchored_velgrip_h24"
+            ),
+            action_mode="anchored",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # SINGLE-ARM RIGHT, single-bolt pick&place (new data_right, 177 ep / 167 train / 20 val). Targets the
+    # diagnosed right-arm generalization failure with MORE right-arm data on a UNIMODAL (one bolt) task.
+    # 7-D right-arm action = per-step ee_local delta pose + ABSOLUTE gripper; proprio = velocity_grip-right
+    # (6-D ee_local velocity + abs gripper = 7-D, ego-centric/init-pose-independent). Both wrist cams kept.
+    # Converter: --arm right --state-mode velocity_grip --action-mode delta --gripper-action absolute.
+    TrainConfig(
+        name="pi05_pika_umi_right_velgrip_delta_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_right_velgrip_delta_h24_train",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_right_velgrip_delta_h24"
+            ),
+            arm="right",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
