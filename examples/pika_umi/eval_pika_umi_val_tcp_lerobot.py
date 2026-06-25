@@ -120,6 +120,11 @@ def main() -> None:
     POSE_DIMS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
     pose_scale = float(np.mean(np.square(np.maximum(action_std[POSE_DIMS], 1e-12))))
 
+    # RGB-D: feed the realsense depth streams when the dataset has them (matches include_depth configs).
+    has_depth = (root / "videos/chunk-000/left_wrist_0_depth").exists()
+    if has_depth:
+        print("RGB-D val: feeding *_wrist_0_depth alongside RGB")
+
     cfg = _config.get_config(args.config)
     HORIZON = int(args.horizon) if args.horizon else int(cfg.model.action_horizon)
     print(f"horizon={HORIZON} | gripper_action={args.gripper_action} | config={args.config}")
@@ -171,6 +176,9 @@ def main() -> None:
         right_mp4 = root / "videos/chunk-000/right_wrist_0_rgb" / f"episode_{ei:06d}.mp4"
         left_img = _video_frames_rgb(left_mp4)
         right_img = _video_frames_rgb(right_mp4)
+        if has_depth:
+            left_depth = _video_frames_rgb(root / "videos/chunk-000/left_wrist_0_depth" / f"episode_{ei:06d}.mp4")
+            right_depth = _video_frames_rgb(root / "videos/chunk-000/right_wrist_0_depth" / f"episode_{ei:06d}.mp4")
 
         ep_dz = {"right": 0.0, "left": 0.0}
         sf = []  # stride frame indices visited this segment
@@ -182,6 +190,9 @@ def main() -> None:
                 "observation/state": states[t].astype(np.float32),
                 "prompt": PROMPT,
             }
+            if has_depth:
+                obs["observation/left_wrist_0_depth"] = left_depth[t]
+                obs["observation/right_wrist_0_depth"] = right_depth[t]
             t0 = time.perf_counter()
             pred = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)
             infer_times.append(time.perf_counter() - t0)
@@ -220,6 +231,9 @@ def main() -> None:
                     "observation/state": states[ef].astype(np.float32),
                     "prompt": PROMPT,
                 }
+                if has_depth:
+                    gobs["observation/left_wrist_0_depth"] = left_depth[ef]
+                    gobs["observation/right_wrist_0_depth"] = right_depth[ef]
                 gp = np.asarray(policy.infer(gobs)["actions"], dtype=np.float64)[0]
                 for ax, idx in zip("xyz", (xi, yi, zi)):
                     grasp_err[arm][ax].append(abs(gp[idx] - gt[ef][idx]) * 1000.0)
