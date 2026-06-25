@@ -185,9 +185,13 @@ class Unnormalize(DataTransformFn):
 class ResizeImages(DataTransformFn):
     height: int
     width: int
+    # True (default) = aspect-preserving resize_with_pad (black bars). False = direct no-pad resize
+    # (distorts aspect but keeps full FOV + spends the whole target resolution on the scene).
+    pad: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        resize = image_tools.resize_with_pad if self.pad else image_tools.resize_no_pad
+        data["image"] = {k: resize(v, self.height, self.width) for k, v in data["image"].items()}
         return data
 
 

@@ -10,6 +10,34 @@ import openpi.shared.array_typing as at
 
 @functools.partial(jax.jit, static_argnums=(1, 2, 3))
 @at.typecheck
+def resize_no_pad(
+    images: at.UInt8[at.Array, "*b h w c"] | at.Float[at.Array, "*b h w c"],
+    height: int,
+    width: int,
+    method: jax.image.ResizeMethod = jax.image.ResizeMethod.LINEAR,
+) -> at.UInt8[at.Array, "*b {height} {width} c"] | at.Float[at.Array, "*b {height} {width} c"]:
+    """Direct (aspect-DISTORTING) resize straight to (height, width) — NO padding, full FOV kept.
+    vs resize_with_pad which fits-and-pads (wastes pixels on black bars + downsamples the whole frame).
+    Anisotropic, but uses the entire target resolution on the scene (more effective pixels for small
+    objects). Same dtype handling as resize_with_pad. The deploy server applies the SAME config
+    model_transforms, so train/serve resize stay matched automatically."""
+    has_batch_dim = images.ndim == 4
+    if not has_batch_dim:
+        images = images[None]  # type: ignore
+    resized = jax.image.resize(images, (images.shape[0], height, width, images.shape[3]), method=method)
+    if images.dtype == jnp.uint8:
+        resized = jnp.round(resized).clip(0, 255).astype(jnp.uint8)
+    elif images.dtype == jnp.float32:
+        resized = resized.clip(-1.0, 1.0)
+    else:
+        raise ValueError(f"Unsupported image dtype: {images.dtype}")
+    if not has_batch_dim:
+        resized = resized[0]
+    return resized
+
+
+@functools.partial(jax.jit, static_argnums=(1, 2, 3))
+@at.typecheck
 def resize_with_pad(
     images: at.UInt8[at.Array, "*b h w c"] | at.Float[at.Array, "*b h w c"],
     height: int,

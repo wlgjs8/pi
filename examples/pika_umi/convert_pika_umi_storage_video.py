@@ -116,9 +116,11 @@ def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "p
     else:
         hold = np.zeros(14, dtype=np.float32)
         if gripper_action == "absolute":
-            # absolute action gripper = next-step opening; holding means keep the current (open) opening
-            hold[6] = last_frame["state"][6]
-            hold[13] = last_frame["state"][13]
+            # absolute action gripper = next-step opening; holding means keep the current (open) opening.
+            # Read from the last ACTION (always 14-D, grip at 6/13) so this works for BOTH state modes — the
+            # 12-D velocity state has no gripper dims (the old state[6]/[13] crashed for state_mode=velocity).
+            hold[6] = last_frame["actions"][6]
+            hold[13] = last_frame["actions"][13]
         # delta mode: zero gripper delta == hold (leave hold[6]/[13] at 0)
     st = np.asarray(last_frame["state"], dtype=np.float32)
     if state_mode == "velocity":
@@ -539,6 +541,8 @@ def main(
     depth_z_near_mm: float = 120.0,
     depth_z_far_mm: float = 700.0,
     depth_units_m: float = 1e-4,  # stored-depth count -> metres (Pika D405: 100µm; check collect.log)
+    num_shards: int = 1,  # parallelism: N processes each convert episodes where i % num_shards == shard_index
+    shard_index: int = 0,  # -> per-shard repo (train+val subset); concat the train shards at train time
 ):
     import functools
     import json
@@ -669,6 +673,8 @@ def main(
     dropped_frames = 0  # frames lost to gap transitions + sub-min-length stubs
     n_src_with_gaps = 0  # source episodes that produced >1 segment or lost frames
     for i, ep in enumerate(episodes):
+        if num_shards > 1 and i % num_shards != shard_index:
+            continue  # this episode handled by another shard process
         which = "val" if i in val_idx else "train"
         # Reads come off the same NFS the encoder writes to; under heavy concurrent load the server can
         # return transient errno-5 EIO (verified: the same files read fine once load drops). Retry those

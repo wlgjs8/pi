@@ -116,6 +116,9 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # If False, images are resized with a direct (no-pad, aspect-distorting) resize instead of the
+    # default aspect-preserving resize_with_pad. Keeps full FOV + spends the whole 224x224 on the scene.
+    resize_pad: bool = True
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -123,7 +126,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -135,7 +138,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -155,7 +158,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
                         _transforms.TokenizeFASTInputs(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
@@ -482,6 +485,10 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # purely vision-driven. UMI per-episode-rotated init pose makes reset-relative proprio
     # non-ego-centric; dropping it removes that frame-inconsistent channel. Matches .8 baseline.
     zero_state: bool = False
+    # If False, use a direct no-pad (aspect-distorting) image resize instead of resize_with_pad —
+    # keeps full FOV and spends the whole 224x224 on the scene (more pixels on small bolts). The served
+    # config carries this, so train/serve resize stay matched. (center_crop, if set, takes precedence.)
+    resize_pad: bool = True
     # Action representation; MUST match the dataset's converter --action-mode. "delta" = per-step ee_local
     # delta (default). "anchored" = UMI relative trajectory (dataset stores abs poses; PikaUmiInputs
     # re-anchors the chunk to its first frame -> no deploy-time integration drift).
@@ -510,7 +517,7 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             inputs=data_input_transforms,
             outputs=[pika_umi_policy.PikaUmiOutputs(action_dim=7 if self.arm == "right" else 14)],
         )
-        model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = ModelTransformFactory(resize_pad=self.resize_pad)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -1583,7 +1590,83 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
-
+    # DEPTH z_near=50 (gripper-visible): IDENTICAL to ..._depth_h24 but the depth dataset is re-converted
+    # with `--depth-z-near-mm 50` (instead of 120) so the gripper fingers (~70-120mm, previously clipped to
+    # black) become a depth gradient -> the policy sees its own fingers vs the bolt. Deploy MUST match with
+    # `--depth-z-near-mm 50`. resize unchanged (resize_with_pad). Single-variable vs ..._depth_h24.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # RESOLUTION A/B (no-pad): IDENTICAL to ..._depth_h24 (SAME original 120/700 depth dataset) EXCEPT
+    # `resize_pad=False` -> direct no-pad resize (full FOV, no black bars, whole 224x224 on the scene;
+    # +~33% vertical pixels where the grasps are). Clean single-variable resize test vs ..._depth_h24 (the
+    # resize_with_pad control). The served config carries resize_pad, so deploy resize stays matched.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_nopad_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_nopad_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+            resize_pad=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # z_near=50 + no-pad combined (if both levers want testing together on the z50 data).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_nopad_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_nopad_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+            resize_pad=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
