@@ -39,6 +39,13 @@ class Pi0Config(_model.BaseModelConfig):
     # RGB-only checkpoints, which keep the default.
     image_keys: tuple[str, ...] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
+    # Square input resolution fed to SigLIP. Default 224 (pi05_base native). Larger (e.g. 392 =
+    # 28x28 patches at patch-14) gives higher effective resolution; the pretrained 224 pos-emb is
+    # 2D-interpolated at forward (SigLIP interpolate_pos_encoding), so pi05_base still loads. Read by
+    # ModelTransformFactory (data resize) AND the pytorch preprocessor (must match) AND inputs_spec.
+    # NOTE: pytorch training path only; the JAX path uses a fixed learned pos-emb (no interpolation).
+    image_resolution: tuple[int, int] = (224, 224)
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -67,7 +74,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_spec = jax.ShapeDtypeStruct([batch_size, *self.image_resolution, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():

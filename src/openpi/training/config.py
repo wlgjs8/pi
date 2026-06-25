@@ -126,7 +126,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
+                        _transforms.ResizeImages(*getattr(model_config, "image_resolution", (224, 224)), pad=self.resize_pad),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -138,7 +138,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
+                        _transforms.ResizeImages(*getattr(model_config, "image_resolution", (224, 224)), pad=self.resize_pad),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -158,7 +158,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
+                        _transforms.ResizeImages(*getattr(model_config, "image_resolution", (224, 224)), pad=self.resize_pad),
                         _transforms.TokenizeFASTInputs(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
@@ -1651,6 +1651,35 @@ _CONFIGS = [
             repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
             assets=AssetsConfig(
                 assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_nopad_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+            resize_pad=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # depth + z50 + no-pad + 392 INPUT RESOLUTION (higher-res lever). Same as ..._depth_z50_nopad_h24
+    # but the SigLIP input is 392x392 (28x28=784 patches at patch-14 vs 16x16=256 at 224 -> 3x more
+    # image tokens, more pixels on the small bolts). The pretrained 224 pos-emb is 2D-interpolated at
+    # forward (interpolate_pos_encoding=True in get_image_features) so pi05_base still loads. Reuses the
+    # z50 depth dataset. PYTORCH path only (JAX path has no pos-emb interpolation). Deploy MUST resize to
+    # 392 + no-pad to match (the served config carries image_resolution + resize_pad).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_nopad_392_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24, image_resolution=(392, 392)),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_nopad_392_h24"
             ),
             base_config=DataConfig(prompt_from_task=True),
             include_depth=True,

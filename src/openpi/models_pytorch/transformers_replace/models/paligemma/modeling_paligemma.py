@@ -239,7 +239,9 @@ class PaliGemmaModel(PaliGemmaPreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        image_outputs = self.vision_tower(pixel_values)
+        # interpolate_pos_encoding=True is a no-op at the native 224 (num_patches == num_positions);
+        # at higher resolutions (e.g. 392) it 2D-interpolates the pretrained pos-emb to the new grid.
+        image_outputs = self.vision_tower(pixel_values, interpolate_pos_encoding=True)
         selected_image_feature = image_outputs.last_hidden_state
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features
