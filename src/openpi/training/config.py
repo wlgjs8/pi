@@ -486,6 +486,9 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # delta (default). "anchored" = UMI relative trajectory (dataset stores abs poses; PikaUmiInputs
     # re-anchors the chunk to its first frame -> no deploy-time integration drift).
     action_mode: str = "delta"
+    # Arm scope; MUST match the dataset's converter --arm. "dual" = 14-D both arms (default). "right" =
+    # 7-D right-arm-only (single-arm policy; the model output is sliced to 7).
+    arm: str = "dual"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -505,7 +508,7 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             data_input_transforms.append(_transforms.CenterCropImages(self.center_crop, self.center_crop))
         data_transforms = _transforms.Group(
             inputs=data_input_transforms,
-            outputs=[pika_umi_policy.PikaUmiOutputs()],
+            outputs=[pika_umi_policy.PikaUmiOutputs(action_dim=7 if self.arm == "right" else 14)],
         )
         model_transforms = ModelTransformFactory()(model_config)
 
@@ -1509,6 +1512,33 @@ _CONFIGS = [
                 assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_anchored_velgrip_h24"
             ),
             action_mode="anchored",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # SINGLE-ARM RIGHT, single-bolt pick&place (new data_right, 177 ep / 167 train / 20 val). Targets the
+    # diagnosed right-arm generalization failure with MORE right-arm data on a UNIMODAL (one bolt) task.
+    # 7-D right-arm action = per-step ee_local delta pose + ABSOLUTE gripper; proprio = velocity_grip-right
+    # (6-D ee_local velocity + abs gripper = 7-D, ego-centric/init-pose-independent). Both wrist cams kept.
+    # Converter: --arm right --state-mode velocity_grip --action-mode delta --gripper-action absolute.
+    TrainConfig(
+        name="pi05_pika_umi_right_velgrip_delta_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_right_velgrip_delta_h24_train",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_right_velgrip_delta_h24"
+            ),
+            arm="right",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

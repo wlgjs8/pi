@@ -32,6 +32,39 @@ import time
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
+
+
+def _integrate_local(deltas: np.ndarray):
+    """Integrate ee_local per-step deltas (H,6 = [pos_delta_local3, rot_delta3]) into the absolute
+    displacement-FROM-ANCHOR at each horizon step. pose[k] = compose of deltas 0..k-1 (k=0 -> anchor=0).
+    Returns (H,3) positions and an (H,) Rotation. This is what the DELTA deploy path accumulates -> its
+    per-step errors compound here, exactly the drift we want to measure."""
+    H = deltas.shape[0]
+    pos = np.zeros((H, 3)); rotvecs = np.zeros((H, 3))
+    cp = np.zeros(3); cr = Rotation.identity()
+    for k in range(H):
+        pos[k] = cp; rotvecs[k] = cr.as_rotvec()
+        cp = cp + cr.apply(deltas[k, :3])
+        cr = cr * Rotation.from_rotvec(deltas[k, 3:6])
+    return pos, Rotation.from_rotvec(rotvecs)
+
+
+def _displacement_from_anchor(chunk: np.ndarray, anchored: bool, arms=(("left", 0), ("right", 7))):
+    """Per-arm absolute displacement-from-anchor at each horizon step k, comparable across delta/anchored.
+    delta -> integrate the per-step deltas (errors compound); anchored -> the row IS T_t^-1 T_{t+k} already.
+    Returns {arm: (positions (H,3), Rotation length H)}. `arms` = (name, base-col) per arm (single-arm right
+    passes [("right", 0)])."""
+    out = {}
+    for arm, base in arms:
+        if anchored:
+            pos = chunk[:, base : base + 3]
+            rot = Rotation.from_rotvec(chunk[:, base + 3 : base + 6])
+        else:
+            pos, rot = _integrate_local(chunk[:, base : base + 6])
+        out[arm] = (pos, rot)
+    return out
+
 
 ROBOTICS_LAB = pathlib.Path("/home/plaif/workspace/robotics_lab")
 LEROBOT_HOME = pathlib.Path("/mnt/pika/lerobot")
@@ -123,7 +156,16 @@ def main() -> None:
     # (delta vs absolute) changes the gripper-dim variance and thus the 14-dim normalizer, the full
     # normalized MSE is NOT comparable across gripper reps. Pose-only error normalized by pose-only std
     # isolates trajectory accuracy and IS comparable across gripper reps and cameras.
-    POSE_DIMS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+    # SINGLE-ARM (right, 7-D action [pos3,rot3,grip]) vs DUAL (14-D). Adapt the dim-dependent constants.
+    SINGLE = actions_all.shape[1] == 7
+    if SINGLE:
+        POSE_DIMS = [0, 1, 2, 3, 4, 5]
+        GRIPS = (6,)
+        ARMS = [("right", 0)]
+    else:
+        POSE_DIMS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+        GRIPS = (6, 13)
+        ARMS = [("left", 0), ("right", 7)]
     pose_scale = float(np.mean(np.square(np.maximum(action_std[POSE_DIMS], 1e-12))))
 
     cfg = _config.get_config(args.config)
@@ -155,8 +197,14 @@ def main() -> None:
 
     sq_first, n_first = 0.0, 0.0
     pose_sq, pose_n = 0.0, 0.0  # first-step POSE-only (12-dim, gripper excluded) MSE
-    perdim_sq = np.zeros(14); perdim_n = 0  # per-dimension first-step squared error (raw units^2)
+    perdim_sq = np.zeros(actions_all.shape[1]); perdim_n = 0  # per-dim first-step squared error (raw units^2)
     sq_chunk, n_chunk = 0.0, 0.0
+    # CUMULATIVE displacement-from-anchor error at each horizon step (mm / deg), per arm. The fair
+    # drift A/B: delta integrates per-step deltas (errors compound) vs anchored predicts T_t^-1 T_{t+k}
+    # directly. Normalizer-free; comparable across action_mode at the overlapping horizon range.
+    cum_terr = {arm: np.zeros(HORIZON) for arm, _ in ARMS}
+    cum_rerr = {arm: np.zeros(HORIZON) for arm, _ in ARMS}
+    cum_n = 0
     chunk_pos_sq = [0.0] * HORIZON  # normalized action MSE per chunk position (step 0..H-1)
     chunk_pos_n = [0] * HORIZON
     phase_sq = {p: 0.0 for p in phase_mod.PHASE_NAMES}
@@ -214,6 +262,14 @@ def main() -> None:
             # delta: the stored per-step deltas are already the chunk.
             target = _anchor_relative_chunk(gt[t : t + HORIZON])[:h] if ANCHORED else gt[t : t + h]
             err2 = (pred[:h] - target) ** 2
+            # cumulative displacement-from-anchor error (mm/deg) at each horizon step k (only full chunks)
+            if h == HORIZON:
+                pe = _displacement_from_anchor(pred[:HORIZON], ANCHORED, ARMS)
+                ge = _displacement_from_anchor(target[:HORIZON], ANCHORED, ARMS)
+                for arm, _ in ARMS:
+                    cum_terr[arm] += np.linalg.norm(pe[arm][0] - ge[arm][0], axis=1) * 1000.0
+                    cum_rerr[arm] += (pe[arm][1] * ge[arm][1].inv()).magnitude() * (180.0 / np.pi)
+                cum_n += 1
             sq_chunk += float(err2.sum()); n_chunk += err2.size
             for k in range(h):
                 chunk_pos_sq[k] += float(err2[k].sum()); chunk_pos_n[k] += err2[k].size
@@ -224,14 +280,15 @@ def main() -> None:
             pose_sq += float(first[POSE_DIMS].sum()); pose_n += len(POSE_DIMS)
             phase = bounds.phase_for_frame(t)
             phase_sq[phase] += float(first.sum()); phase_n[phase] += first.size
-            if phase == "right_pick":
-                ep_dz["right"] += float(pred[fi][9] - target[fi][9])
-            elif phase == "left_pick":
-                ep_dz["left"] += float(pred[fi][2] - target[fi][2])
+            if not SINGLE:  # phase-z-drift + dual-arm gripper bookkeeping (dual-arm dims only)
+                if phase == "right_pick":
+                    ep_dz["right"] += float(pred[fi][9] - target[fi][9])
+                elif phase == "left_pick":
+                    ep_dz["left"] += float(pred[fi][2] - target[fi][2])
+                pdg["left"].append(float(pred[fi][GRIP_DIMS[0]]))
+                pdg["right"].append(float(pred[fi][GRIP_DIMS[1]]))
+                grip_dmse_sq += float(first[GRIP_DIMS[0]] + first[GRIP_DIMS[1]]); grip_dmse_n += 2
             sf.append(t)
-            pdg["left"].append(float(pred[fi][GRIP_DIMS[0]]))
-            pdg["right"].append(float(pred[fi][GRIP_DIMS[1]]))
-            grip_dmse_sq += float(first[GRIP_DIMS[0]] + first[GRIP_DIMS[1]]); grip_dmse_n += 2
             frame_count += 1
 
         if bounds.clean:
@@ -321,10 +378,11 @@ def main() -> None:
                 }
                 for ax, di in axmap.items()
             }
-            for arm, axmap in {
+            for arm, axmap in ({"right": {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5, "grip": 6}}
+                               if SINGLE else {
                 "left":  {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5, "grip": 6},
                 "right": {"x": 7, "y": 8, "z": 9, "rx": 10, "ry": 11, "rz": 12, "grip": 13},
-            }.items()
+            }).items()
         },
         "per_axis_note": "first-step per-dim error; rmse is per 30Hz step (translation mm, rotation deg); "
                          "normalized_mse=MSE/var, 1.0==predicting the mean (worst meaningful)",
@@ -338,6 +396,23 @@ def main() -> None:
         "chunk8": {
             "action_mse": sq_chunk / max(n_chunk, 1.0),
             "normalized_action_mse": (sq_chunk / max(n_chunk, 1.0)) / scale,
+        },
+        "cumulative_position_error": {
+            # THE FAIR DRIFT A/B (normalizer-free, comparable across action_mode at overlapping horizon).
+            # Absolute displacement-from-anchor error at each horizon step k: delta integrates predicted
+            # per-step deltas (errors compound) vs anchored predicts T_t^-1 T_{t+k} directly. Compare A's
+            # and B's translation_mm[k] / rotation_deg[k] curves over k=0..min(H_A,H_B)-1.
+            "note": "mean over windows; translation mm, rotation deg; index k = displacement to frame t+k "
+                    "(k=0 is the anchor, ~0). delta integrates predicted deltas; anchored is direct.",
+            "windows": cum_n,
+            **{
+                f"{arm}_translation_mm": [float(cum_terr[arm][k] / max(cum_n, 1)) for k in range(HORIZON)]
+                for arm, _ in ARMS
+            },
+            **{
+                f"{arm}_rotation_deg": [float(cum_rerr[arm][k] / max(cum_n, 1)) for k in range(HORIZON)]
+                for arm, _ in ARMS
+            },
         },
         "chunk_by_position_normalized": [
             (chunk_pos_sq[k] / max(chunk_pos_n[k], 1.0)) / scale for k in range(HORIZON)

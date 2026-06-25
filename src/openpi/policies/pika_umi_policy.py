@@ -100,5 +100,8 @@ class PikaUmiInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PikaUmiOutputs(transforms.DataTransformFn):
+    # Real action dim sliced from the model's padded output: 14 (dual arm) or 7 (single right arm).
+    action_dim: int = 14
+
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :14])}
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

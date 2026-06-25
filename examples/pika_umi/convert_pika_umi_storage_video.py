@@ -39,6 +39,8 @@ PROMPT = (
     "pick up the black bolt with the right arm and put it in the right box, then pick up the gray bolt with the "
     "left arm and put it in the left box"
 )
+# Single-arm (right) task prompt for --arm right datasets.
+RIGHT_PROMPT = "pick up the bolt with the right arm and put it in the box"
 
 
 def _decode_color(encoded: np.ndarray, crop_frac: float | None = None) -> np.ndarray:
@@ -327,6 +329,7 @@ def _make_dataset(
     img_shape: tuple[int, int, int] = (480, 640, 3),
     include_depth: bool = False,
     state_dim: int = 14,
+    action_dim: int = 14,
 ):
     import shutil
 
@@ -337,7 +340,7 @@ def _make_dataset(
         "left_wrist_0_rgb": _img_feat,
         "right_wrist_0_rgb": _img_feat,
         "state": {"dtype": "float32", "shape": (state_dim,), "names": ["state"]},
-        "actions": {"dtype": "float32", "shape": (14,), "names": ["actions"]},
+        "actions": {"dtype": "float32", "shape": (action_dim,), "names": ["actions"]},
     }
     if include_depth:
         # Depth is a separate image stream through the SAME SigLIP (PikaUmiInputs include_depth);
@@ -375,6 +378,8 @@ def _episode_frames(
     depth_units_m: float = 1e-4,
     state_mode: str = "pose",
     action_mode: str = "delta",
+    arm: str = "dual",
+    prompt: str = PROMPT,
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -452,6 +457,18 @@ def _episode_frames(
             else:
                 states[incoming_gap] = 0.0
 
+        # Single-arm RIGHT: slice to the right-arm channels. action [Rpos3,Rrot3,Rgrip] = cols 7:14 (7-D,
+        # delta or anchored abs-pose). state by mode: velocity_grip/pose -> right 7 cols incl gripper;
+        # velocity -> right 6 vel cols. Left wrist image is kept (a second scene view).
+        if arm == "right":
+            _rs = {
+                "velocity_grip": [7, 8, 9, 10, 11, 12, 13],
+                "velocity": [6, 7, 8, 9, 10, 11],
+                "pose": [7, 8, 9, 10, 11, 12, 13],
+            }[state_mode]
+            states = states[:, _rs]
+            actions = actions[:, 7:14]
+
         # Contiguous runs of clean writable frames, broken at gap transitions.
         segments, run = [], []
         for t in range(n_act):
@@ -471,7 +488,7 @@ def _episode_frames(
                 "right_wrist_0_rgb": _decode_color(right_images[t], crop_frac),
                 "state": states[t],
                 "actions": actions[t],
-                "task": PROMPT,
+                "task": prompt,
             }
             if include_depth:
                 fr["left_wrist_0_depth"] = _depth_to_image(
@@ -510,6 +527,7 @@ def main(
     gripper_binary_th: float = 25.0,  # gripper_action=binary: opening >= th -> 1 (open) else 0 (closed/grip)
     state_mode: str = "pose",  # proprio: "pose"(14-D reset-rel) | "velocity"(12-D) | "velocity_grip"(14-D vel+absGrip)
     action_mode: str = "delta",  # action: "delta"(per-step ee_local) | "anchored"(UMI-style relative trajectory)
+    arm: str = "dual",  # "dual"(14-D both arms) | "right"(7-D right arm only; left wrist image kept)
     exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
     include_path_substr: str | None = None,  # keep ONLY episodes whose path contains this (e.g. "onrobot_rgbd")
     # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
@@ -540,7 +558,15 @@ def main(
         raise ValueError(f"--action-mode must be 'delta' or 'anchored', got {action_mode!r}")
     if action_mode == "anchored" and gripper_action == "delta":
         raise ValueError("--action-mode anchored requires --gripper-action absolute or binary (delta is invalid)")
+    if arm not in ("dual", "right"):
+        raise ValueError(f"--arm must be 'dual' or 'right', got {arm!r}")
     state_dim = 12 if state_mode == "velocity" else 14  # velocity_grip and pose are both 14-D
+    action_dim = 14
+    prompt = PROMPT
+    if arm == "right":  # single-arm right: 7-D action; state = right channels only
+        action_dim = 7
+        state_dim = 6 if state_mode == "velocity" else 7
+        prompt = RIGHT_PROMPT
     # Center-crop only makes sense for the wide-FOV fisheye; ignore it for realsense so an A/B keeps
     # the realsense arm at full frame.
     crop_frac = fisheye_crop_frac if (camera == "fisheye" and fisheye_crop_frac) else None
@@ -566,7 +592,7 @@ def main(
     print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
     print(
         f"camera={camera} | gripper_action={gripper_action} | state_mode={state_mode} (state_dim={state_dim}) | "
-        f"action_mode={action_mode} | "
+        f"action_mode={action_mode} | arm={arm} (state_dim={state_dim}, action_dim={action_dim}) | "
         f"crop={'none' if crop_frac is None else f'{crop_frac:g} -> {img_shape[:2]}'} | "
         f"tail_pad_frames={tail_pad_frames} (train only)"
     )
@@ -631,9 +657,9 @@ def main(
         val_idx = set(order[:n_val].tolist())
         print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val (camera={camera})")
 
-    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth, state_dim)
+    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth, state_dim, action_dim)
     val_ds = (
-        _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth, state_dim)
+        _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth, state_dim, action_dim)
         if n_val > 0 else None
     )
 
@@ -654,7 +680,7 @@ def main(
                 segments, n_writable = _episode_frames(
                     ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
                     gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m, state_mode,
-                    action_mode,
+                    action_mode, arm, prompt,
                 )
                 break
             except Exception as e:
@@ -717,6 +743,8 @@ def main(
                 "state_mode": state_mode,
                 "state_dim": state_dim,
                 "action_mode": action_mode,
+                "arm": arm,
+                "action_dim": action_dim,
                 "val_from_record": str(val_from_record) if val_from_record is not None else None,
                 "exclude_path_substr": exclude_path_substr,
                 "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,
