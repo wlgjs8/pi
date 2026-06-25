@@ -1590,6 +1590,37 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # ABSOLUTE-ORIENTATION ANCHOR on the depth baseline: IDENTICAL to ..._velproprio_depth_h24 (depth +
+    # abs gripper + ee_local delta + h24) EXCEPT the proprio is 20-D `velocity_absrot6d` (per arm
+    # [pos_vel(3), abs_rot_6d(6), grip(1)]) instead of 12-D velocity. Targets the 2026-06-25 rollout
+    # failures: #1 pick RX over-tilt + #2 place yaw-180 drift -> both = velocity proprio has NO absolute
+    # orientation anchor, so EE attitude is an uncorrected integral that drifts (and rotvec's +-pi jump
+    # bites at 180). Position stays VELOCITY (ego-centric, OOD-safe), orientation becomes an ABSOLUTE 6D
+    # anchor (continuous, gripper-points-down distribution matches UMI<->robot -> OOD-safe). Dataset:
+    # `--include-depth --state-mode velocity_absrot6d --gripper-action absolute`. DEPLOY: runtime
+    # _proprio_state must emit the matching 20-D (live TCP abs orientation -> R_align -> 6D + pos-vel + grip).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velabsrot6d_depth_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velabsrot6d_depth",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velabsrot6d_depth_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     # DEPTH z_near=50 (gripper-visible): IDENTICAL to ..._depth_h24 but the depth dataset is re-converted
     # with `--depth-z-near-mm 50` (instead of 120) so the gripper fingers (~70-120mm, previously clipped to
     # black) become a depth gradient -> the policy sees its own fingers vs the bolt. Deploy MUST match with
