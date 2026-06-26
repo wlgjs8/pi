@@ -1652,6 +1652,39 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # RESET-RELATIVE-ROTATION ANCHOR on the depth baseline (replaces the broken gravity anchor): IDENTICAL
+    # to ..._velproprio_depth_h24 EXCEPT the proprio is 14-D `velocity_rotrel` (per arm
+    # [pos_vel(3), rot_rel(3), grip(1)]). rot_rel = rotvec(R0^-1 R_t) (orientation relative to the episode
+    # reset) -- W-INVARIANT (cancels the unmeasured steamvr->stand exactly like ee_local velocity, verified
+    # 4e-16), so NO frame measurement is needed (the absolute/gravity anchor was ~147deg OOD at deploy).
+    # An orientation ANCHOR (not a progress-clock) that targets BOTH 2026-06-25 rollout failures: #1 pick
+    # RX over-tilt AND #2 place yaw drift (yaw-vs-reset is W-invariant -> safe). = the original
+    # reset-relative pose proprio with POSITION swapped to velocity (removes only the clock). Same 14-D
+    # layout as velocity_grip (grip at 6,13) so deploy/eval gripper handling is unchanged. Dataset:
+    # `--include-depth --state-mode velocity_rotrel --gripper-action absolute`. DEPLOY: runtime
+    # _proprio_state emits pos_vel + reset-relative rot (it already computes rot_rel in pose mode) + grip.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velrotrel_depth_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velrotrel_depth",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velrotrel_depth_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     # DEPTH z_near=50 (gripper-visible): IDENTICAL to ..._depth_h24 but the depth dataset is re-converted
     # with `--depth-z-near-mm 50` (instead of 120) so the gripper fingers (~70-120mm, previously clipped to
     # black) become a depth gradient -> the policy sees its own fingers vs the bolt. Deploy MUST match with

@@ -134,6 +134,9 @@ def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "p
     elif state_mode == "velocity_grav":
         hold_state = st.copy()
         hold_state[[0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]] = 0.0  # zero pos+rot vel; HOLD gravity(6-8,16-18)+grip(9,19)
+    elif state_mode == "velocity_rotrel":
+        hold_state = st.copy()
+        hold_state[[0, 1, 2, 7, 8, 9]] = 0.0  # zero pos-vel; HOLD rot_rel(3-5,10-12)+grip(6,13)
     else:
         hold_state = st
     out = {
@@ -307,6 +310,36 @@ def _state_velocity_grav(left_pose, right_pose, left_grip, right_grip, world_dow
     return np.concatenate(
         [_arm_velocity_grav(left_pose, left_grip, world_down), _arm_velocity_grav(right_pose, right_grip, world_down)],
         axis=1,
+    ).astype(np.float32)
+
+
+def _arm_rot_rel(pose) -> np.ndarray:
+    """RESET-RELATIVE rotation = rotvec(R0^-1 . R_t), in the EPISODE-RESET body frame (R0 = frame 0).
+    W-INVARIANT: a global world rotation cancels ((W R0)^-1 (W R_t) = R0^-1 R_t), exactly like ee_local
+    velocity -> needs NO steamvr->stand frame measurement (unlike absolute orientation / gravity, which
+    broke at deploy by ~147deg). An orientation ANCHOR relative to the episode reset that is NOT a
+    progress-clock (orientation does not grow monotonically); anchors all 3 axes INCLUDING yaw-vs-reset,
+    so it targets BOTH #1 (pick RX over-tilt) and #2 (place yaw drift) safely. vel[0]-style: rot_rel[0]=0."""
+    r0 = Rotation.from_quat(pose[0, 3:7])
+    return (r0.inv() * Rotation.from_quat(pose[:, 3:7])).as_rotvec().astype(np.float32)
+
+
+def _arm_velocity_rotrel(pose, grip) -> np.ndarray:
+    """Per-arm 7-D = [pos_vel_local(3), rot_rel(3), grip_abs(1)]: ego-centric position VELOCITY (no
+    progress-clock) + W-invariant reset-relative rotation ANCHOR + absolute gripper. Surgically the
+    original reset-relative pose proprio with POSITION swapped to velocity (removes only the clock)."""
+    pos_vel = _arm_velocity(pose)[:, :3]  # ego-centric position velocity (drop rot-vel)
+    g = (grip[:, None] / 100.0).astype(np.float32)
+    return np.concatenate([pos_vel, _arm_rot_rel(pose), g], axis=1).astype(np.float32)  # (N,7)
+
+
+def _state_velocity_rotrel(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
+    """VELOCITY-POS + RESET-RELATIVE-ROT + ABS-GRIP proprio (14-D): per arm
+    [pos_vel(3), rot_rel(3), grip(1)] (grip at dims 6,13 -- same layout as velocity_grip, so the deploy/
+    eval gripper handling is unchanged). Across a gap only the pos-vel dims/arm are bogus (caller zeros
+    them); rot_rel is referenced to the original episode reset -> valid across gaps, like the gripper."""
+    return np.concatenate(
+        [_arm_velocity_rotrel(left_pose, left_grip), _arm_velocity_rotrel(right_pose, right_grip)], axis=1
     ).astype(np.float32)
 
 
@@ -513,6 +546,8 @@ def _episode_frames(
             states = _state_velocity_absrot6d(left_pose, right_pose, left_grip, right_grip)
         elif state_mode == "velocity_grav":
             states = _state_velocity_grav(left_pose, right_pose, left_grip, right_grip)
+        elif state_mode == "velocity_rotrel":
+            states = _state_velocity_rotrel(left_pose, right_pose, left_grip, right_grip)
         else:
             states = _state(left_pose, right_pose, left_grip, right_grip)
         # Action: per-step ee_local delta (default) | anchored abs-pose-per-frame (UMI-style, relative chunk
@@ -535,10 +570,13 @@ def _episode_frames(
         # Velocity proprio is the INCOMING step (t-1 -> t): bogus across a gap. The first kept frame of a
         # post-gap segment has gap[t-1]=True -> zero its velocity (treat a segment start as zero motion).
         # For velocity_grip, zero ONLY the velocity dims (keep the absolute gripper at 6,13).
-        if state_mode in ("velocity", "velocity_grip", "velocity_absrot6d", "velocity_grav"):
+        if state_mode in ("velocity", "velocity_grip", "velocity_absrot6d", "velocity_grav", "velocity_rotrel"):
             incoming_gap = np.zeros(states.shape[0], dtype=bool)
             incoming_gap[1 : 1 + gap.shape[0]] = gap  # incoming_gap[t] = (step t-1 -> t spanned a gap)
-            if state_mode == "velocity_grip":
+            if state_mode == "velocity_rotrel":
+                vel_dims = [0, 1, 2, 7, 8, 9]  # only pos-vel dims/arm (keep rot_rel + grip at 6,13)
+                states[np.ix_(incoming_gap, vel_dims)] = 0.0
+            elif state_mode == "velocity_grip":
                 vel_dims = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # exclude gripper dims 6,13
                 states[np.ix_(incoming_gap, vel_dims)] = 0.0
             elif state_mode == "velocity_absrot6d":
@@ -560,6 +598,7 @@ def _episode_frames(
                 "pose": [7, 8, 9, 10, 11, 12, 13],
                 "velocity_absrot6d": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],  # right arm 10-D
                 "velocity_grav": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],  # right arm 10-D
+                "velocity_rotrel": [7, 8, 9, 10, 11, 12, 13],  # right arm 7-D [pos_vel3, rot_rel3, grip1]
             }[state_mode]
             states = states[:, _rs]
             actions = actions[:, 7:14]
@@ -620,7 +659,7 @@ def main(
     fisheye_crop_frac: float | None = None,
     tail_pad_frames: int = 0,
     gripper_binary_th: float = 25.0,  # gripper_action=binary: opening >= th -> 1 (open) else 0 (closed/grip)
-    state_mode: str = "pose",  # "pose"(14)|"velocity"(12)|"velocity_grip"(14)|"velocity_absrot6d"(20)|"velocity_grav"(20: pos_vel3+rot_vel3+gravity3+grip1 /arm)
+    state_mode: str = "pose",  # pose(14)|velocity(12)|velocity_grip(14)|velocity_absrot6d(20)|velocity_grav(20)|velocity_rotrel(14: pos_vel3+rot_rel3+grip1 /arm; W-invariant orient anchor)
     action_mode: str = "delta",  # action: "delta"(per-step ee_local) | "anchored"(UMI-style relative trajectory)
     arm: str = "dual",  # "dual"(14-D both arms) | "right"(7-D right arm only; left wrist image kept)
     exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
@@ -649,8 +688,8 @@ def main(
         raise ValueError("--include-depth requires --camera realsense (RGB-D must be the same aligned view)")
     if include_depth and not (0.0 <= depth_z_near_mm < depth_z_far_mm):
         raise ValueError(f"need 0 <= depth_z_near_mm < depth_z_far_mm, got {depth_z_near_mm}/{depth_z_far_mm}")
-    if state_mode not in ("pose", "velocity", "velocity_grip", "velocity_absrot6d", "velocity_grav"):
-        raise ValueError(f"--state-mode must be 'pose', 'velocity', 'velocity_grip', 'velocity_absrot6d', or 'velocity_grav', got {state_mode!r}")
+    if state_mode not in ("pose", "velocity", "velocity_grip", "velocity_absrot6d", "velocity_grav", "velocity_rotrel"):
+        raise ValueError(f"--state-mode must be one of pose|velocity|velocity_grip|velocity_absrot6d|velocity_grav|velocity_rotrel, got {state_mode!r}")
     if action_mode not in ("delta", "anchored"):
         raise ValueError(f"--action-mode must be 'delta' or 'anchored', got {action_mode!r}")
     if action_mode == "anchored" and gripper_action == "delta":
