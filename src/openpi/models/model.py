@@ -177,11 +177,16 @@ def preprocess_observation(
                     augmax.Resize(width, height),
                     augmax.Rotate((-5, 5)),
                 ]
-            transforms += [
-                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
-            ]
-            sub_rngs = jax.random.split(rng, image.shape[0])
-            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            # Photometric (color) jitter is NOT label-preserving for depth-as-image
+            # (`*_depth`): brightness/contrast/saturation corrupt the metric depth signal.
+            # Geometric transforms above are fine for depth; only skip ColorJitter here.
+            if not key.endswith("_depth"):
+                transforms += [
+                    augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+                ]
+            if transforms:
+                sub_rngs = jax.random.split(rng, image.shape[0])
+                image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 
             # Back to [-1, 1].
             image = image * 2.0 - 1.0

@@ -116,27 +116,30 @@ def preprocess_observation_pytorch(
                         align_corners=False,
                     ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
 
-            # Color augmentations for all cameras
-            # Random brightness
-            # Use tensor operations instead of .item() for torch.compile compatibility
-            brightness_factor = 0.7 + torch.rand(1, device=image.device) * 0.6  # Random factor between 0.7 and 1.3
-            image = image * brightness_factor
+            # Color (photometric) augmentations for all cameras EXCEPT depth-as-image.
+            # brightness/contrast/saturation are not label-preserving for metric depth
+            # (`*_depth`); geometric transforms above are fine, so only skip color here.
+            if not key.endswith("_depth"):
+                # Random brightness
+                # Use tensor operations instead of .item() for torch.compile compatibility
+                brightness_factor = 0.7 + torch.rand(1, device=image.device) * 0.6  # Random factor between 0.7 and 1.3
+                image = image * brightness_factor
 
-            # Random contrast
-            # Use tensor operations instead of .item() for torch.compile compatibility
-            contrast_factor = 0.6 + torch.rand(1, device=image.device) * 0.8  # Random factor between 0.6 and 1.4
-            mean = image.mean(dim=[1, 2, 3], keepdim=True)
-            image = (image - mean) * contrast_factor + mean
+                # Random contrast
+                # Use tensor operations instead of .item() for torch.compile compatibility
+                contrast_factor = 0.6 + torch.rand(1, device=image.device) * 0.8  # Random factor between 0.6 and 1.4
+                mean = image.mean(dim=[1, 2, 3], keepdim=True)
+                image = (image - mean) * contrast_factor + mean
 
-            # Random saturation (convert to HSV, modify S, convert back)
-            # For simplicity, we'll just apply a random scaling to the color channels
-            # Use tensor operations instead of .item() for torch.compile compatibility
-            saturation_factor = 0.5 + torch.rand(1, device=image.device) * 1.0  # Random factor between 0.5 and 1.5
-            gray = image.mean(dim=-1, keepdim=True)
-            image = gray + (image - gray) * saturation_factor
+                # Random saturation (convert to HSV, modify S, convert back)
+                # For simplicity, we'll just apply a random scaling to the color channels
+                # Use tensor operations instead of .item() for torch.compile compatibility
+                saturation_factor = 0.5 + torch.rand(1, device=image.device) * 1.0  # Random factor between 0.5 and 1.5
+                gray = image.mean(dim=-1, keepdim=True)
+                image = gray + (image - gray) * saturation_factor
 
-            # Clamp values to [0, 1]
-            image = torch.clamp(image, 0, 1)
+                # Clamp values to [0, 1]
+                image = torch.clamp(image, 0, 1)
 
             # Back to [-1, 1]
             image = image * 2.0 - 1.0
