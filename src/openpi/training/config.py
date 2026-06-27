@@ -1691,7 +1691,14 @@ _CONFIGS = [
     # `--depth-z-near-mm 50`. resize unchanged (resize_with_pad). Single-variable vs ..._depth_h24.
     TrainConfig(
         name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_h24",
-        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
+        # RGB-D: declare the 2 depth image slots so they flow through (paired with the pi0.py
+        # preprocess_observation image_keys fix). pi05_base loads fine — SigLIP is shared, no per-image params.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+        ),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
             assets=AssetsConfig(
