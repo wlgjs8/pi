@@ -42,6 +42,30 @@ PROMPT = (
 # Single-arm (right) task prompt for --arm right datasets.
 RIGHT_PROMPT = "pick up the bolt with the right arm and put it in the box"
 
+# --prompt-mode phase_color: per-PHASE, COLOR-grounded prompts (one active arm+color per phase) so the
+# VLA must read the color word. Box is COORDINATED (color-matched, on the picking arm's side), so the box
+# color is DERIVED from the bolt color via this map -- no separate tag needed.
+BOX_COLORS = {"black": "green", "gray": "gray"}
+
+
+def _parse_arm_bolt_colors(s: str) -> dict:
+    """'right=black,left=gray' -> {'right':'black','left':'gray'}. Missing/blank -> normal default."""
+    out = {"right": "black", "left": "gray"}
+    for tok in str(s).split(","):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            k = k.strip().lower()
+            if k in out:
+                out[k] = v.strip().lower()
+    return out
+
+
+def _color_prompt(arm: str, color: str, box_colors: dict) -> str:
+    """Per-phase, color-grounded prompt for one arm: 'pick up the {color} bolt with the {arm} arm and
+    put it in the {matched-box} box'. The box color is the coordinated color-match (BOX_COLORS)."""
+    box = box_colors.get(color, color)
+    return f"pick up the {color} bolt with the {arm} arm and put it in the {box} box"
+
 
 def _decode_color(encoded: np.ndarray, crop_frac: float | None = None) -> np.ndarray:
     bgr = cv2.imdecode(np.asarray(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -144,7 +168,7 @@ def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "p
         "right_wrist_0_rgb": last_frame["right_wrist_0_rgb"],
         "state": hold_state,
         "actions": hold,
-        "task": PROMPT,
+        "task": last_frame.get("task", PROMPT),  # keep the terminal (left-phase) prompt for the hold tail
     }
     for k in ("left_wrist_0_depth", "right_wrist_0_depth"):  # carry depth through the hold tail
         if k in last_frame:
@@ -496,6 +520,8 @@ def _episode_frames(
     action_mode: str = "delta",
     arm: str = "dual",
     prompt: str = PROMPT,
+    prompt_mode: str = "single",
+    box_colors: dict | None = None,
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -616,13 +642,34 @@ def _episode_frames(
             segments.append(run)
         segments = [s for s in segments if len(s) >= min_seg_frames]
 
+        # per-PHASE COLOR prompts (--prompt-mode phase_color): split at the RIGHT release (right gripper
+        # close->open); before = right phase (right arm's color), after = left phase (left arm's color).
+        # Box color = coordinated match (BOX_COLORS). arm_bolt_colors comes from the episode HDF5 attr
+        # (legacy episodes lack it -> normal default right=black,left=gray, so old data stays reusable).
+        prompts = None
+        if prompt_mode == "phase_color":
+            bc = box_colors or BOX_COLORS
+            raw = f.attrs.get("arm_bolt_colors", "right=black,left=gray")
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            acol = _parse_arm_bolt_colors(raw)
+            if arm in ("right", "left"):  # single-arm: one color, no phase split
+                prompts = [_color_prompt(arm, acol[arm], bc)] * (n_act + 1)
+            else:
+                rp = _color_prompt("right", acol["right"], bc)
+                lp = _color_prompt("left", acol["left"], bc)
+                opn = (right_grip[: n_act + 1] >= binary_th).astype(np.int8)  # 1=open
+                cross = np.where((opn[1:] == 1) & (opn[:-1] == 0))[0] + 1  # right close->open = place release
+                boundary = int(cross[-1]) if cross.size else n_act  # no release -> treat all as right phase
+                prompts = [rp if t <= boundary else lp for t in range(n_act + 1)]
+
         def _frame(t):
             fr = {
                 "left_wrist_0_rgb": _decode_color(left_images[t], crop_frac),
                 "right_wrist_0_rgb": _decode_color(right_images[t], crop_frac),
                 "state": states[t],
                 "actions": actions[t],
-                "task": prompt,
+                "task": (prompts[t] if prompts is not None else prompt),
             }
             if include_depth:
                 fr["left_wrist_0_depth"] = _depth_to_image(
@@ -662,6 +709,9 @@ def main(
     state_mode: str = "pose",  # pose(14)|velocity(12)|velocity_grip(14)|velocity_absrot6d(20)|velocity_grav(20)|velocity_rotrel(14: pos_vel3+rot_rel3+grip1 /arm; W-invariant orient anchor)
     action_mode: str = "delta",  # action: "delta"(per-step ee_local) | "anchored"(UMI-style relative trajectory)
     arm: str = "dual",  # "dual"(14-D both arms) | "right"(7-D right arm only; left wrist image kept)
+    prompt_mode: str = "single",  # "single"(one fixed PROMPT) | "phase_color"(per-phase color-grounded prompt
+    #   from each episode's HDF5 attr arm_bolt_colors; right release splits right/left phase; box=coordinated)
+    box_colors: str = "black=green,gray=gray",  # bolt-color -> coordinated box-color map (phase_color mode)
     exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
     include_path_substr: str | None = None,  # keep ONLY episodes whose path contains this (e.g. "onrobot_rgbd")
     # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
@@ -696,6 +746,14 @@ def main(
         raise ValueError("--action-mode anchored requires --gripper-action absolute or binary (delta is invalid)")
     if arm not in ("dual", "right"):
         raise ValueError(f"--arm must be 'dual' or 'right', got {arm!r}")
+    if prompt_mode not in ("single", "phase_color"):
+        raise ValueError(f"--prompt-mode must be 'single' or 'phase_color', got {prompt_mode!r}")
+    # phase_color: bolt-color -> coordinated box-color map (parse '--box-colors black=green,gray=gray').
+    _box_colors_map = dict(BOX_COLORS)
+    for _tok in str(box_colors).split(","):
+        if "=" in _tok:
+            _k, _v = _tok.split("=", 1)
+            _box_colors_map[_k.strip().lower()] = _v.strip().lower()
     # state_dim per mode (dual-arm): pose/velocity_grip 14, velocity 12, velocity_absrot6d/velocity_grav 20.
     state_dim = {"velocity": 12, "velocity_absrot6d": 20, "velocity_grav": 20}.get(state_mode, 14)
     action_dim = 14
@@ -819,7 +877,7 @@ def main(
                 segments, n_writable = _episode_frames(
                     ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
                     gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m, state_mode,
-                    action_mode, arm, prompt,
+                    action_mode, arm, prompt, prompt_mode, _box_colors_map,
                 )
                 break
             except Exception as e:
