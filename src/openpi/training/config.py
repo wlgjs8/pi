@@ -1718,6 +1718,39 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # COLOR-PROMPT on the z50_real (real depth) baseline: IDENTICAL to ..._depth_z50_h24 (depth z50 +
+    # velocity proprio + abs gripper + h24, depth image_keys) EXCEPT the dataset is converted with
+    # --prompt-mode phase_color over normal(579)+swap(173) data: per-arm pick&place phase prompts whose
+    # bolt+box color comes from each episode's arm_bolt_colors attr (right release splits right/left phase;
+    # legacy=normal). The swap data decorrelates color from arm so the VLA must READ the prompt color
+    # (wiki finding B: it currently ignores it). Validate with the prompt color-SWAP test + rollout.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_colorprompt_h24",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50_colorprompt",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_colorprompt_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     # RESOLUTION A/B (no-pad): IDENTICAL to ..._depth_h24 (SAME original 120/700 depth dataset) EXCEPT
     # `resize_pad=False` -> direct no-pad resize (full FOV, no black bars, whole 224x224 on the scene;
     # +~33% vertical pixels where the grasps are). Clean single-variable resize test vs ..._depth_h24 (the
