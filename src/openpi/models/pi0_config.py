@@ -39,6 +39,12 @@ class Pi0Config(_model.BaseModelConfig):
     # RGB-only checkpoints, which keep the default.
     image_keys: tuple[str, ...] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
+    # AUXILIARY color head: if > 0, add a small MLP on the per-wrist SigLIP features that classifies
+    # the target bolt's color (black/gray), with weight `aux_color_weight` on its cross-entropy loss.
+    # 0.0 = off (default; existing checkpoints unaffected). Forces the vision features the action
+    # expert cross-attends to encode color (the encoder already separates black/gray at ~94%).
+    aux_color_weight: float = 0.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

@@ -1,4 +1,5 @@
 import dataclasses
+import re
 
 import einops
 import numpy as np
@@ -6,6 +7,27 @@ from scipy.spatial.transform import Rotation
 
 from openpi import transforms
 from openpi.models import model as _model
+
+# phase_color prompt -> (color, arm), e.g. "...the black bolt with the right arm...".
+_BOLT_COLOR_RE = re.compile(r"the (black|gray) bolt with the (right|left) arm")
+
+
+def _bolt_color_labels(prompt) -> tuple[np.ndarray, np.ndarray]:
+    """Derive per-frame AUXILIARY color labels from the phase_color prompt (free signal, no extra
+    dataset columns). Returns (right_label, left_label) each int32[1]; 0=black, 1=gray, -1=ignore.
+    Only the arm named in the prompt (the one whose wrist is looking at its target bolt this phase)
+    gets a label; the other arm is -1 (ignored by the aux loss). Non-phase_color prompts -> both -1."""
+    r, l = -1, -1
+    if isinstance(prompt, (str, bytes)):
+        s = prompt.decode() if isinstance(prompt, bytes) else prompt
+        m = _BOLT_COLOR_RE.search(s)
+        if m:
+            c = 0 if m.group(1) == "black" else 1
+            if m.group(2) == "right":
+                r = c
+            else:
+                l = c
+    return np.array([r], dtype=np.int32), np.array([l], dtype=np.int32)
 
 
 def _anchor_relative_chunk(actions: np.ndarray) -> np.ndarray:
@@ -55,6 +77,9 @@ class PikaUmiInputs(transforms.DataTransformFn):
     # ABSOLUTE poses; here we re-express the chunk relative to its first frame -> each row composes onto the
     # live anchor at deploy with NO integration. MUST match the converter's --action-mode.
     action_mode: str = "delta"
+    # If true, parse the phase_color prompt into per-arm bolt-color labels (0=black,1=gray,-1=ignore)
+    # and pass them through as `bolt_color_right`/`bolt_color_left` for the model's auxiliary color head.
+    aux_color_labels: bool = False
 
     def __call__(self, data: dict) -> dict:
         left_wrist = _parse_image(data["observation/left_wrist_0_rgb"])
@@ -94,6 +119,9 @@ class PikaUmiInputs(transforms.DataTransformFn):
             inputs["actions"] = acts
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        if self.aux_color_labels:
+            inputs["bolt_color_right"], inputs["bolt_color_left"] = _bolt_color_labels(data.get("prompt"))
 
         return inputs
 

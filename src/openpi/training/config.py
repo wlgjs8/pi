@@ -496,6 +496,10 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # Arm scope; MUST match the dataset's converter --arm. "dual" = 14-D both arms (default). "right" =
     # 7-D right-arm-only (single-arm policy; the model output is sliced to 7).
     arm: str = "dual"
+    # If true, PikaUmiInputs parses each frame's phase_color prompt into per-arm bolt-color labels
+    # (bolt_color_right/left) for the model's auxiliary color head. Needs a phase_color dataset and a
+    # model with aux_color_weight > 0. No extra dataset columns (label derived from the prompt string).
+    aux_color_labels: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -510,7 +514,7 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             repack_map["observation/left_wrist_0_depth"] = "left_wrist_0_depth"
             repack_map["observation/right_wrist_0_depth"] = "right_wrist_0_depth"
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
-        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state, action_mode=self.action_mode)]
+        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state, action_mode=self.action_mode, aux_color_labels=self.aux_color_labels)]
         if self.center_crop is not None:
             data_input_transforms.append(_transforms.CenterCropImages(self.center_crop, self.center_crop))
         data_transforms = _transforms.Group(
@@ -1739,6 +1743,42 @@ _CONFIGS = [
             ),
             base_config=DataConfig(prompt_from_task=True),
             include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # AUX-COLOR (A1): IDENTICAL to ..._colorprompt_h24 (same colorprompt normal+swap phase_color dataset,
+    # depth z50 + velocity proprio + abs gripper + h24) PLUS an auxiliary per-wrist bolt-color head:
+    # PikaUmiInputs parses each phase_color prompt -> per-arm color label (no extra dataset columns), and
+    # model.aux_color_weight>0 adds a CE loss on a small MLP over the wrist SigLIP features. Diagnosis showed
+    # a frozen SigLIP linear-probe separates black/gray at 94% (classical pixels only 70%) -> the color IS
+    # perceivable; this forces the action-attended features to USE it. Keep swap (contrastive). Reuses the
+    # colorprompt dataset + norm-stats (no re-conversion).
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_colorprompt_auxcolor_h24",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+            aux_color_weight=0.5,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50_colorprompt",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_colorprompt_auxcolor_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+            aux_color_labels=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,

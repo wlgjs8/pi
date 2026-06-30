@@ -108,6 +108,20 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # AUXILIARY color head (A1): a small MLP on the per-wrist SigLIP image features that classifies
+        # the target bolt's color (black/gray). Off unless config.aux_color_weight > 0.
+        self.aux_color_weight = float(getattr(config, "aux_color_weight", 0.0))
+        self._aux_img_embs = None
+        if self.aux_color_weight > 0:
+            self.aux_color_head = nn.Sequential(
+                nn.Linear(paligemma_config.width, 256), nn.GELU(), nn.Linear(256, 2)
+            )
+            ik = list(config.image_keys)
+            self._wrist_idx = {
+                "right": ik.index("right_wrist_0_rgb") if "right_wrist_0_rgb" in ik else None,
+                "left": ik.index("left_wrist_0_rgb") if "left_wrist_0_rgb" in ik else None,
+            }
+
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
@@ -211,6 +225,11 @@ class PI0Pytorch(nn.Module):
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+
+        # Stash per-image embeddings for the auxiliary color head (training only; guarded so the
+        # torch.compiled sampling path -- self.training=False -- has no side effect).
+        if self.aux_color_weight > 0 and self.training:
+            self._aux_img_embs = list(embs)
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -373,7 +392,43 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        main_loss = F.mse_loss(u_t, v_t, reduction="none")
+        if self.aux_color_weight > 0:
+            return main_loss.mean() + self.aux_color_weight * self._aux_color_loss(observation)
+        return main_loss
+
+    def _aux_color_loss(self, observation):
+        """Cross-entropy for the per-wrist bolt-color head over the stashed SigLIP image features.
+        Labels (0=black, 1=gray, -1=ignore) come from the prompt via PikaUmiInputs; -1 is masked.
+        An all-ignore batch returns 0 still connected to the head (keeps DDP/static_graph happy)."""
+        embs = self._aux_img_embs
+        head_dtype = self.aux_color_head[0].weight.dtype
+        logits_all, labels_all = [], []
+        for arm, attr in (("right", "aux_bolt_color_right"), ("left", "aux_bolt_color_left")):
+            idx = self._wrist_idx.get(arm)
+            lab = getattr(observation, attr, None)
+            if idx is None or lab is None:
+                continue
+            pooled = embs[idx].mean(dim=1).to(dtype=head_dtype)  # [b, ntok, dim] -> [b, dim]
+            logits_all.append(self.aux_color_head(pooled).float())  # [b, 2]
+            labels_all.append(lab.reshape(-1).long())  # [b]
+        dev = self.aux_color_head[0].weight.device
+        if not logits_all:
+            return torch.zeros((), device=dev)
+        logits = torch.cat(logits_all, 0)
+        labels = torch.cat(labels_all, 0)
+        valid = labels != -1
+        if valid.any():
+            ce = F.cross_entropy(logits[valid], labels[valid])
+            self._aux_dbg = getattr(self, "_aux_dbg", 0) + 1
+            if self._aux_dbg % 500 == 1 and (  # periodic monitor (rank 0 only): is the color being learned?
+                not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            ):
+                acc = (logits[valid].argmax(-1) == labels[valid]).float().mean().item()
+                logging.info(f"[aux-color] step~{self._aux_dbg} valid_frac={valid.float().mean().item():.2f} "
+                             f"ce={ce.item():.4f} train_acc={acc:.2f}")
+            return ce
+        return logits.sum() * 0.0  # all-ignore this batch: 0 loss, head still in the graph
 
     @torch.no_grad()
     def sample_actions(
