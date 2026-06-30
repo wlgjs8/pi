@@ -1095,6 +1095,34 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # COLORPROMPT with the MODEL-INTERNAL train-time photometric jitter DISABLED (Pi0Config.train_image_aug=
+    # False). Verified: preprocess_observation_pytorch applies random brightness(0.7-1.3)/contrast(0.6-1.4)/
+    # saturation(0.5-1.5) to every non-depth image whenever train=True, INDEPENDENT of the data `image_aug`
+    # (so image_aug=None did NOT disable it) -> every prior colorprompt/velproprio run jittered exactly the
+    # brightness/reflectance cue the black-vs-shiny-silver distinction needs. This is the cheap first A/B for
+    # color grounding. SAME dataset + norm stats as ..._colorprompt_h24 (jitter is model-side, not in the
+    # data) -> NO re-convert / NO norm recompute; only the model-internal aug differs.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_colorprompt_nojitter_h24",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24, train_image_aug=False),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_colorprompt",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_colorprompt_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     # Same as pi05_pika_umi_aug (h8, relrel, RGB aug) but center-crops each image to
     # 384x384 (cuts only ~48px top/bottom + L/R edges, keeping the lower-centre grasp
     # region) and then resize_with_pad downsamples 384->224 -> higher effective resolution
