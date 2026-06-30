@@ -1,3 +1,12 @@
+import os
+
+# Cap JAX GPU memory BEFORE jax is imported (via the openpi imports below).
+# JAX defaults to preallocating 75% of total VRAM, so a JAX checkpoint shows
+# ~24GB on a 32GB card even though it only needs ~8-10GB. Pin the fraction so
+# inference stays small by default. Both are setdefault() so an explicit env
+# var on the command line still wins (e.g. XLA_PYTHON_CLIENT_PREALLOCATE=false).
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.4")
+
 import dataclasses
 import enum
 import logging
