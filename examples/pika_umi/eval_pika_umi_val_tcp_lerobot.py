@@ -78,9 +78,16 @@ GRIP_DIMS = (6, 13)
 
 
 def _swap_prompt(s: str) -> str:
-    """COLOR-SWAP a phase_color prompt to test language sensitivity (wiki finding B re-test): swap the
-    bolt color gray<->black AND the coordinated box gray<->green. If the policy READS the color, its
-    output changes under this swap; if it ignores language, the output is ~unchanged."""
+    """COLOR-SWAP a phase_color prompt to test language sensitivity: swap the bolt color AND the
+    coordinated box. If the policy READS the color, its output changes under this swap; if it ignores
+    language, the output is ~unchanged. Handles both the SCHEMA prompt (auxcolor: TARGET_BOLT=black
+    <-> shiny silver, DESTINATION_BOX=green <-> gray) and the legacy natural-sentence prompt."""
+    if "TARGET_BOLT=" in s:  # schema format (auxcolor-v2)
+        s = (s.replace("TARGET_BOLT=black", "\x00").replace("TARGET_BOLT=shiny silver", "TARGET_BOLT=black")
+              .replace("\x00", "TARGET_BOLT=shiny silver"))
+        s = (s.replace("DESTINATION_BOX=green", "\x01").replace("DESTINATION_BOX=gray", "DESTINATION_BOX=green")
+              .replace("\x01", "DESTINATION_BOX=gray"))
+        return s
     s = s.replace("gray bolt", "\x00").replace("black bolt", "gray bolt").replace("\x00", "black bolt")
     s = s.replace("gray box", "\x01").replace("green box", "gray box").replace("\x01", "green box")
     return s
@@ -96,18 +103,21 @@ def _load_phase_segmentation():
 
 
 def _video_frames_rgb(mp4: pathlib.Path) -> np.ndarray:
-    """Decode a whole episode mp4 -> (T,H,W,3) uint8 RGB (cv2 returns BGR)."""
-    cap = cv2.VideoCapture(str(mp4))
-    out = []
-    while True:
-        ok, bgr = cap.read()
-        if not ok:
-            break
-        out.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-    cap.release()
-    if not out:
-        raise ValueError(f"no frames decoded from {mp4}")
-    return np.stack(out)
+    """Decode a whole episode mp4 -> (T,H,W,3) uint8 RGB (cv2 returns BGR). Retries on transient NFS
+    read failures (a contended NFS can make VideoCapture return 0 frames spuriously)."""
+    for attempt in range(4):
+        cap = cv2.VideoCapture(str(mp4))
+        out = []
+        while True:
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            out.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if out:
+            return np.stack(out)
+        time.sleep(2.0 * (attempt + 1))  # transient NFS/decoder hiccup -> back off and retry
+    raise ValueError(f"no frames decoded from {mp4} (after retries)")
 
 
 def main() -> None:
@@ -122,6 +132,10 @@ def main() -> None:
     parser.add_argument("--lerobot-home", type=str, default=str(LEROBOT_HOME))
     parser.add_argument("--tag", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None, help="limit number of val episodes (debug)")
+    parser.add_argument("--binding-filter", type=str, default="all", choices=["all", "normal", "swap"],
+                        help="restrict to episodes whose color binding is normal (right->black/left->silver) "
+                             "or swap (right->silver/left->black), from the phase_color prompt. 'all' = both. "
+                             "Run twice (normal, swap) for the per-bucket pose/phase breakdown.")
     parser.add_argument("--n-select", type=int, default=1,
                         help="if >1, wrap in MedoidPolicy: sample N chunks/frame and use the consensus "
                              "(medoid) chunk for all metrics — measures performance WITH best-of-N selection")
@@ -247,6 +261,8 @@ def main() -> None:
     chunk_pos_n = [0] * HORIZON
     phase_sq = {p: 0.0 for p in phase_mod.PHASE_NAMES}
     phase_n = {p: 0.0 for p in phase_mod.PHASE_NAMES}
+    phase_pose_sq = {p: 0.0 for p in phase_mod.PHASE_NAMES}  # POSE-only (12-dim, no gripper) per-phase
+    phase_pose_n = {p: 0.0 for p in phase_mod.PHASE_NAMES}
     GRASP = {"right": (7, 8, 9, "b1"), "left": (0, 1, 2, "b3")}
     grasp_err = {arm: {ax: [] for ax in "xyz"} for arm in ("right", "left")}
     intz = {"right": [], "left": []}
@@ -265,6 +281,12 @@ def main() -> None:
 
     for ei in range(n_ep):
         a, b = int(ep_from[ei]), int(ep_to[ei])
+        if args.binding_filter != "all":  # per-bucket eval: keep only normal- or swap-binding episodes
+            _tk = set(tasks_all[a:b])
+            _bind = "swap" if any(("shiny silver" in t and "ACTIVE_ARM=right" in t)
+                                  or ("black" in t and "ACTIVE_ARM=left" in t) for t in _tk) else "normal"
+            if _bind != args.binding_filter:
+                continue
         states = states_all[a:b]
         # full-episode per-frame actions: GT[t] is the ee_local delta from t->t+1 (last frame has none)
         gt = actions_all[a:b - 1]  # (T-1, 14)
@@ -348,6 +370,7 @@ def main() -> None:
             pose_sq += float(first[POSE_DIMS].sum()); pose_n += len(POSE_DIMS)
             phase = bounds.phase_for_frame(t)
             phase_sq[phase] += float(first.sum()); phase_n[phase] += first.size
+            phase_pose_sq[phase] += float(first[POSE_DIMS].sum()); phase_pose_n[phase] += len(POSE_DIMS)
             if not SINGLE:  # phase-z-drift + dual-arm gripper bookkeeping (dual-arm dims only)
                 if phase == "right_pick":
                     ep_dz["right"] += float(pred[fi][9] - target[fi][9])
@@ -523,6 +546,9 @@ def main() -> None:
         ),
         "first_step_by_phase_normalized": {
             p: (phase_sq[p] / max(phase_n[p], 1.0)) / scale for p in phase_mod.PHASE_NAMES
+        },
+        "first_step_by_phase_pose_only_normalized": {  # 12-dim POSE-only (gripper 6,13 excluded), pose_scale
+            p: (phase_pose_sq[p] / max(phase_pose_n[p], 1.0)) / pose_scale for p in phase_mod.PHASE_NAMES
         },
         "grasp_instant_error_mm": {
             arm: {

@@ -513,6 +513,9 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
         if self.include_depth:
             repack_map["observation/left_wrist_0_depth"] = "left_wrist_0_depth"
             repack_map["observation/right_wrist_0_depth"] = "right_wrist_0_depth"
+        if self.aux_color_labels:
+            repack_map["bolt_color_right"] = "bolt_color_right"
+            repack_map["bolt_color_left"] = "bolt_color_left"
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
         data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state, action_mode=self.action_mode, aux_color_labels=self.aux_color_labels)]
         if self.center_crop is not None:
@@ -1763,18 +1766,19 @@ _CONFIGS = [
     # perceivable; this forces the action-attended features to USE it. Keep swap (contrastive). Reuses the
     # colorprompt dataset + norm-stats (no re-conversion).
     TrainConfig(
-        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_colorprompt_auxcolor_h24",
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_auxcolor_h24",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
             action_horizon=24,
             image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
             aux_color_weight=0.5,
+            photometric_aug=False,  # OFF: jitter randomizes the black-vs-silver brightness cue this task needs
         ),
         data=LeRobotPikaUmiDataConfig(
-            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50_colorprompt",
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50_auxcolor",
             assets=AssetsConfig(
-                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_colorprompt_auxcolor_h24"
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_auxcolor_h24"
             ),
             base_config=DataConfig(prompt_from_task=True),
             include_depth=True,

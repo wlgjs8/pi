@@ -176,7 +176,8 @@ class PI0Pytorch(nn.Module):
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(
-            observation, train=train, image_keys=self.config.image_keys
+            observation, train=train, image_keys=self.config.image_keys,
+            photometric_aug=getattr(self.config, "photometric_aug", True),
         )
         return (
             list(observation.images.values()),
@@ -397,10 +398,24 @@ class PI0Pytorch(nn.Module):
             return main_loss.mean() + self.aux_color_weight * self._aux_color_loss(observation)
         return main_loss
 
+    @staticmethod
+    def _fingertip_pool(emb):
+        """Pool the SigLIP tokens over the CENTER-LOWER region of the wrist image (where the gripper +
+        target bolt sit at pre-grasp), instead of the whole image — focuses the color head on the bolt
+        and away from distractor bolts/floor. emb: [b, ntok, dim]. Falls back to whole-image mean if the
+        token count isn't a perfect square (e.g. a CLS token present)."""
+        b, ntok, d = emb.shape
+        g = int(round(ntok ** 0.5))
+        if g * g != ntok:
+            return emb.mean(dim=1)
+        grid = emb.reshape(b, g, g, d)
+        r0, c0, c1 = g // 2, g // 4, g - g // 4  # lower half rows, center columns
+        return grid[:, r0:g, c0:c1, :].reshape(b, -1, d).mean(dim=1)
+
     def _aux_color_loss(self, observation):
         """Cross-entropy for the per-wrist bolt-color head over the stashed SigLIP image features.
-        Labels (0=black, 1=gray, -1=ignore) come from the prompt via PikaUmiInputs; -1 is masked.
-        An all-ignore batch returns 0 still connected to the head (keeps DDP/static_graph happy)."""
+        Labels (0=black, 1=silver, -1=ignore) come from the converter (timed pre-grasp) via PikaUmiInputs;
+        -1 is masked. An all-ignore batch returns 0 still connected to the head (keeps DDP/static_graph happy)."""
         embs = self._aux_img_embs
         head_dtype = self.aux_color_head[0].weight.dtype
         logits_all, labels_all = [], []
@@ -409,7 +424,7 @@ class PI0Pytorch(nn.Module):
             lab = getattr(observation, attr, None)
             if idx is None or lab is None:
                 continue
-            pooled = embs[idx].mean(dim=1).to(dtype=head_dtype)  # [b, ntok, dim] -> [b, dim]
+            pooled = self._fingertip_pool(embs[idx]).to(dtype=head_dtype)  # [b, ntok, dim] -> [b, dim]
             logits_all.append(self.aux_color_head(pooled).float())  # [b, 2]
             labels_all.append(lab.reshape(-1).long())  # [b]
         dev = self.aux_color_head[0].weight.device

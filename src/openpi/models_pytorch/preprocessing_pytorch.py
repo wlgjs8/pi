@@ -23,6 +23,7 @@ def preprocess_observation_pytorch(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    photometric_aug: bool = True,
 ):
     """Torch.compile-compatible version of preprocess_observation_pytorch with simplified type annotations.
 
@@ -119,7 +120,9 @@ def preprocess_observation_pytorch(
             # Color (photometric) augmentations for all cameras EXCEPT depth-as-image.
             # brightness/contrast/saturation are not label-preserving for metric depth
             # (`*_depth`); geometric transforms above are fine, so only skip color here.
-            if not key.endswith("_depth"):
+            # Also skipped entirely when photometric_aug=False (color-critical tasks: the jitter
+            # randomizes the black-vs-silver brightness cue the policy must read).
+            if photometric_aug and not key.endswith("_depth"):
                 # Random brightness
                 # Use tensor operations instead of .item() for torch.compile compatibility
                 brightness_factor = 0.7 + torch.rand(1, device=image.device) * 0.6  # Random factor between 0.7 and 1.3

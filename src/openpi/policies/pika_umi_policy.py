@@ -121,7 +121,12 @@ class PikaUmiInputs(transforms.DataTransformFn):
             inputs["prompt"] = data["prompt"]
 
         if self.aux_color_labels:
-            inputs["bolt_color_right"], inputs["bolt_color_left"] = _bolt_color_labels(data.get("prompt"))
+            # Per-frame pre-grasp color labels are emitted by the converter (timed, from arm_bolt_colors).
+            # Read them from the dataset columns; absent at inference -> -1 (aux loss is training-only).
+            r = data.get("bolt_color_right")
+            l = data.get("bolt_color_left")
+            inputs["bolt_color_right"] = np.asarray(r if r is not None else [-1], dtype=np.int32).reshape(1)
+            inputs["bolt_color_left"] = np.asarray(l if l is not None else [-1], dtype=np.int32).reshape(1)
 
         return inputs
 

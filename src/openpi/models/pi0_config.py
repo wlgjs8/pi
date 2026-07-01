@@ -42,8 +42,13 @@ class Pi0Config(_model.BaseModelConfig):
     # AUXILIARY color head: if > 0, add a small MLP on the per-wrist SigLIP features that classifies
     # the target bolt's color (black/gray), with weight `aux_color_weight` on its cross-entropy loss.
     # 0.0 = off (default; existing checkpoints unaffected). Forces the vision features the action
-    # expert cross-attends to encode color (the encoder already separates black/gray at ~94%).
+    # expert cross-attends to encode color (the encoder already separates black/silver at ~94%).
     aux_color_weight: float = 0.0
+
+    # Train-time PHOTOMETRIC augmentation (brightness/contrast/saturation jitter) in the model's image
+    # preprocess. Default True (legacy). Set False for COLOR-critical tasks: the jitter randomizes exactly
+    # the brightness cue that separates black vs (shiny) silver bolts, training the model to ignore it.
+    photometric_aug: bool = True
 
     def __post_init__(self):
         if self.max_token_len is None:
