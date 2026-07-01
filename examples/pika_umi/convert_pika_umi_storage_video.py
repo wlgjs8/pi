@@ -46,6 +46,11 @@ RIGHT_PROMPT = "pick up the bolt with the right arm and put it in the box"
 # VLA must read the color word. Box is COORDINATED (color-matched, on the picking arm's side), so the box
 # color is DERIVED from the bolt color via this map -- no separate tag needed.
 BOX_COLORS = {"black": "green", "gray": "gray"}
+# Prompt WORD per internal color key. The "gray" bolt is actually a shiny silver bolt; calling it
+# "gray" collides with the gray floor + gray box (grounds to the big box, not the small bolt). Use
+# "shiny silver" so the bolt word is distinct. Internal keys / aux labels stay black|gray.
+COLOR_WORD = {"black": "black", "gray": "shiny silver"}
+COLOR_VAL = {"black": 0, "gray": 1}  # aux color-head class id (0=black, 1=silver)
 
 
 def _parse_arm_bolt_colors(s: str) -> dict:
@@ -61,10 +66,29 @@ def _parse_arm_bolt_colors(s: str) -> dict:
 
 
 def _color_prompt(arm: str, color: str, box_colors: dict) -> str:
-    """Per-phase, color-grounded prompt for one arm: 'pick up the {color} bolt with the {arm} arm and
-    put it in the {matched-box} box'. The box color is the coordinated color-match (BOX_COLORS)."""
+    """Per-phase, color-grounded SCHEMA prompt for one arm:
+    'ACTIVE_ARM={arm}. TARGET_BOLT={word}. DESTINATION_BOX={box}.' — a schema (not a natural sentence
+    that repeats a color word across bolt+box) so each color word maps to one role. The silver bolt is
+    described as 'shiny silver' (distinct from the gray box/floor)."""
     box = box_colors.get(color, color)
-    return f"pick up the {color} bolt with the {arm} arm and put it in the {box} box"
+    word = COLOR_WORD.get(color, color)
+    return f"ACTIVE_ARM={arm}. TARGET_BOLT={word}. DESTINATION_BOX={box}."
+
+
+def _pregrasp_color_labels(grip: np.ndarray, color_val: int, n: int, binary_th: float,
+                           lo: int = 15, hi: int = 5) -> np.ndarray:
+    """Per-frame AUX color label for one arm, valid ONLY in the pre-grasp window before each grasp
+    (gripper open->closed transition): frames [close-lo, close-hi) get `color_val`, else -1. This is
+    when the active wrist looks at the target bolt (not yet occluded by the closed gripper / not place /
+    not idle), so the color-head label is clean. Label source = arm_bolt_colors (NOT the prompt)."""
+    closed = (np.asarray(grip[:n]) < binary_th).astype(np.int8)
+    closes = np.where((closed[1:] == 1) & (closed[:-1] == 0))[0] + 1  # open->closed = grasp
+    lbl = np.full(n, -1, dtype=np.int32)
+    for c in closes:
+        a, b = max(0, int(c) - lo), max(0, int(c) - hi)
+        if b > a:
+            lbl[a:b] = color_val
+    return lbl
 
 
 def _decode_color(encoded: np.ndarray, crop_frac: float | None = None) -> np.ndarray:
@@ -173,6 +197,9 @@ def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "p
     for k in ("left_wrist_0_depth", "right_wrist_0_depth"):  # carry depth through the hold tail
         if k in last_frame:
             out[k] = last_frame[k]
+    for k in ("bolt_color_right", "bolt_color_left"):  # hold tail is post-episode -> aux label ignore (-1)
+        if k in last_frame:
+            out[k] = np.array([-1], dtype=np.int32)
     return out
 
 
@@ -470,6 +497,7 @@ def _make_dataset(
     include_depth: bool = False,
     state_dim: int = 14,
     action_dim: int = 14,
+    emit_color_labels: bool = False,
 ):
     import shutil
 
@@ -487,6 +515,9 @@ def _make_dataset(
         # realsense-only (480x640) so it shares img_shape (depth requires --camera realsense).
         features["left_wrist_0_depth"] = _img_feat
         features["right_wrist_0_depth"] = _img_feat
+    if emit_color_labels:
+        features["bolt_color_right"] = {"dtype": "int32", "shape": (1,), "names": ["color"]}
+        features["bolt_color_left"] = {"dtype": "int32", "shape": (1,), "names": ["color"]}
     return LeRobotDataset.create(
         repo_id=repo_id,
         root=root,
@@ -522,6 +553,7 @@ def _episode_frames(
     prompt: str = PROMPT,
     prompt_mode: str = "single",
     box_colors: dict | None = None,
+    emit_color_labels: bool = False,
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -663,6 +695,17 @@ def _episode_frames(
                 boundary = int(cross[-1]) if cross.size else n_act  # no release -> treat all as right phase
                 prompts = [rp if t <= boundary else lp for t in range(n_act + 1)]
 
+        # AUX color labels (--emit-color-labels): per-arm bolt color (0=black, 1=silver) valid ONLY in the
+        # pre-grasp window before each grasp (from arm_bolt_colors, NOT the prompt); -1 elsewhere.
+        right_aux = left_aux = None
+        if emit_color_labels:
+            raw2 = f.attrs.get("arm_bolt_colors", "right=black,left=gray")
+            if isinstance(raw2, bytes):
+                raw2 = raw2.decode()
+            acol2 = _parse_arm_bolt_colors(raw2)
+            right_aux = _pregrasp_color_labels(right_grip, COLOR_VAL[acol2["right"]], n_act + 1, binary_th)
+            left_aux = _pregrasp_color_labels(left_grip, COLOR_VAL[acol2["left"]], n_act + 1, binary_th)
+
         def _frame(t):
             fr = {
                 "left_wrist_0_rgb": _decode_color(left_images[t], crop_frac),
@@ -671,6 +714,9 @@ def _episode_frames(
                 "actions": actions[t],
                 "task": (prompts[t] if prompts is not None else prompt),
             }
+            if right_aux is not None:
+                fr["bolt_color_right"] = np.array([right_aux[t]], dtype=np.int32)
+                fr["bolt_color_left"] = np.array([left_aux[t]], dtype=np.int32)
             if include_depth:
                 fr["left_wrist_0_depth"] = _depth_to_image(
                     _decode_depth(left_depth[t]), depth_z_near_mm, depth_z_far_mm, depth_units_m
@@ -712,6 +758,8 @@ def main(
     prompt_mode: str = "single",  # "single"(one fixed PROMPT) | "phase_color"(per-phase color-grounded prompt
     #   from each episode's HDF5 attr arm_bolt_colors; right release splits right/left phase; box=coordinated)
     box_colors: str = "black=green,gray=gray",  # bolt-color -> coordinated box-color map (phase_color mode)
+    emit_color_labels: bool = False,  # emit per-frame pre-grasp bolt-color labels (bolt_color_right/left) for
+    #   the model's auxiliary color head (0=black,1=silver,-1=ignore; from arm_bolt_colors, timed to pre-grasp)
     exclude_path_substr: str | None = None,  # drop episodes whose path contains this (e.g. "onrobot")
     include_path_substr: str | None = None,  # keep ONLY episodes whose path contains this (e.g. "onrobot_rgbd")
     # Pin val to a prior split's `val` list; ALL other found episodes (incl. newly collected) -> train.
@@ -852,9 +900,9 @@ def main(
         val_idx = set(order[:n_val].tolist())
         print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val (camera={camera})")
 
-    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth, state_dim, action_dim)
+    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth, state_dim, action_dim, emit_color_labels)
     val_ds = (
-        _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth, state_dim, action_dim)
+        _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth, state_dim, action_dim, emit_color_labels)
         if n_val > 0 else None
     )
 
@@ -877,7 +925,7 @@ def main(
                 segments, n_writable = _episode_frames(
                     ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
                     gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m, state_mode,
-                    action_mode, arm, prompt, prompt_mode, _box_colors_map,
+                    action_mode, arm, prompt, prompt_mode, _box_colors_map, emit_color_labels,
                 )
                 break
             except Exception as e:
