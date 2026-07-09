@@ -11,7 +11,10 @@ import dataclasses
 import enum
 import logging
 import socket
+import time
 
+import jax
+import numpy as np
 import tyro
 
 from openpi.policies import policy as _policy
@@ -75,6 +78,12 @@ class Args:
     # max-autotune-no-cudagraphs | off (eager) | config (keep the checkpoint's setting).
     compile_mode: str = "default"
 
+    # Run one fake forward pass at startup so the first real request doesn't pay the
+    # torch.compile / JIT-trace + CUDA allocation cost (which can be many seconds). The
+    # fake observation is built from the model's inputs_spec, so it has the exact shapes
+    # and dtypes the input transforms produce -- the compiled graph is reused on real calls.
+    warmup: bool = True
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -132,9 +141,50 @@ def create_policy(args: Args) -> _policy.Policy:
             )
 
 
+def _resolve_config(args: Args):
+    """Resolve the (compile-mode-adjusted) training config that create_policy will use."""
+    match args.policy:
+        case Checkpoint():
+            return _config_with_compile_mode(args.policy.config, args.compile_mode)
+        case Default():
+            if checkpoint := DEFAULT_CHECKPOINT.get(args.env):
+                return _config_with_compile_mode(checkpoint.config, args.compile_mode)
+            raise ValueError(f"Unsupported environment mode: {args.env}")
+
+
+def warmup_policy(policy: _policy.Policy, train_config) -> None:
+    """Run one fake forward pass so the first real request skips compile/allocation cost.
+
+    Builds a fake Observation from the model's ``inputs_spec`` (the exact shapes/dtypes the
+    input transforms produce) and drives the SAME callable inference uses
+    (``policy._sample_actions``) with the SAME sample_kwargs, so torch.compile / JAX-jit
+    caches the graph that real calls hit. Warms the base Policy before any Medoid/Recorder wrap.
+    """
+    obs = train_config.model.fake_obs(batch_size=1)
+    sample_kwargs = dict(policy._sample_kwargs)
+
+    logging.info("Warming up policy with one fake forward pass...")
+    t0 = time.monotonic()
+    if policy._is_pytorch_model:
+        import torch
+
+        device = policy._pytorch_device
+        obs_t = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)).to(device), obs)
+        with torch.no_grad():
+            policy._sample_actions(device, obs_t, **sample_kwargs)
+        if "cuda" in str(device):
+            torch.cuda.synchronize()
+    else:
+        actions = policy._sample_actions(jax.random.key(0), obs, **sample_kwargs)
+        jax.block_until_ready(actions)
+    logging.info("Warmup complete in %.1fs", time.monotonic() - t0)
+
+
 def main(args: Args) -> None:
     logging.info("Serving with compile_mode=%s, num_medoid_samples=%d", args.compile_mode, args.num_medoid_samples)
     policy = create_policy(args)
+    if args.warmup:
+        warmup_policy(policy, _resolve_config(args))
     if args.num_medoid_samples > 1:
         logging.info("Wrapping policy in MedoidPolicy (num_samples=%d): consensus selection at inference",
                      args.num_medoid_samples)
