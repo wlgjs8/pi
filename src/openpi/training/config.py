@@ -1839,6 +1839,45 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # SPATIAL-PROMPT FORCING (C1, prompt-conditioning capacity test — llm-wiki vla-rollout-diagnosis
+    # 2026-07-11). The 752-ep identifiability audit showed demonstrations are nearest-rule-consistent, so
+    # NO truthful prompt can be forced with images present (action ⊥ prompt | geometry). This config tests
+    # whether the ARCHITECTURE can condition on language at all, using existing data only: (1) per-episode
+    # prompts re-labeled from kinematics ("pick up the {near|far} {left|right} bolt with the right arm,
+    # and ... left arm" — 16 balanced classes from grasp-target position in each arm's local start frame;
+    # unlabeled 74/527 eps keep the original prompt); (2) Pi0Config.train_obs_dropout=0.3 zeros all camera
+    # images + masks per sample at train time, making the prompt the ONLY reach-target predictor on ~30% of
+    # samples. Dataset = local relabeled COPY of ..._velproprio_depth_z50 (HF_LEROBOT_HOME=
+    # /home/plaif/workspace/lerobot_local); actions/states identical -> norm stats copied from the z50 run.
+    # Eval: prompt-swap probe on dropped-obs (capacity) and full-obs (transfer) branches.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_spatialprompt_h24",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+            train_obs_dropout=0.3,
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50_spatialprompt",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_spatialprompt_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     # RESOLUTION A/B (no-pad): IDENTICAL to ..._depth_h24 (SAME original 120/700 depth dataset) EXCEPT
     # `resize_pad=False` -> direct no-pad resize (full FOV, no black bars, whole 224x224 on the scene;
     # +~33% vertical pixels where the grasps are). Clean single-variable resize test vs ..._depth_h24 (the

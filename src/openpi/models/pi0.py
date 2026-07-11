@@ -67,6 +67,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        # Train-time observation dropout prob (see Pi0Config.train_obs_dropout). Applied in
+        # compute_loss only; sample_actions/serving never drop.
+        self.train_obs_dropout = float(getattr(config, "train_obs_dropout", 0.0))
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -189,12 +192,27 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, dropout_rng, noise_rng, time_rng = jax.random.split(rng, 4)
         # Pass image_keys=actual keys (like pi0_fast) so EXTRA image streams (e.g. *_wrist_0_depth from
         # include_depth) survive preprocessing instead of being silently dropped to the default 3 RGB keys.
         observation = _model.preprocess_observation(
             preprocess_rng, observation, train=train, image_keys=list(observation.images.keys())
         )
+        if train and self.train_obs_dropout > 0.0:
+            # OBSERVATION DROPOUT (prompt-conditioning forcing): with prob p per sample, zero every
+            # camera image AND mask its tokens out, so the prompt is the only target predictor on
+            # that sample. train=True only — sample_actions/serving are untouched.
+            drop = jax.random.bernoulli(dropout_rng, self.train_obs_dropout, observation.state.shape[:-1])
+            observation = _model.Observation(
+                images={k: jnp.where(drop[..., None, None, None], jnp.zeros_like(v), v)
+                        for k, v in observation.images.items()},
+                image_masks={k: jnp.where(drop, False, v) for k, v in observation.image_masks.items()},
+                state=observation.state,
+                tokenized_prompt=observation.tokenized_prompt,
+                tokenized_prompt_mask=observation.tokenized_prompt_mask,
+                token_ar_mask=observation.token_ar_mask,
+                token_loss_mask=observation.token_loss_mask,
+            )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)

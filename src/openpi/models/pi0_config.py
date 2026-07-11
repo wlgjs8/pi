@@ -47,6 +47,14 @@ class Pi0Config(_model.BaseModelConfig):
     # Default True = unchanged behaviour; set False for the color-grounding A/B.
     train_image_aug: bool = True
 
+    # Train-time OBSERVATION-DROPOUT probability (JAX path). With prob p per SAMPLE, every camera
+    # image is zeroed AND its image mask set False inside compute_loss (train=True only;
+    # sample_actions/serving never drop). Purpose: prompt-conditioning forcing — on a dropped
+    # sample the language prompt is the only predictor of the reach target, creating the
+    # identifiability pressure the demonstrations lack (nearest-rule data -> action ⊥ prompt |
+    # geometry whenever images are present; see llm-wiki vla-rollout-diagnosis 2026-07-11).
+    train_obs_dropout: float = 0.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
