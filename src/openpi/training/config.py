@@ -1808,6 +1808,37 @@ _CONFIGS = [
         assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
         wandb_enabled=False,
     ),
+    # VELOCITY_GRIP proprio A/B: IDENTICAL to ..._velproprio_depth_z50_h24 EXCEPT the dataset is converted
+    # with --state-mode velocity_grip (14-D = ee_local velocity 12 + ABSOLUTE gripper 2) instead of velocity
+    # (12-D). Tests whether adding the current absolute gripper opening back into proprio (closed-loop grasp
+    # feedback) helps grasp/place. resize_with_pad (padded). Deploy: proprio_mode=velocity_grip.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velgripproprio_depth_z50_h24",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgripproprio_depth_z50",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velgripproprio_depth_z50_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
     # RESOLUTION A/B (no-pad): IDENTICAL to ..._depth_h24 (SAME original 120/700 depth dataset) EXCEPT
     # `resize_pad=False` -> direct no-pad resize (full FOV, no black bars, whole 224x224 on the scene;
     # +~33% vertical pixels where the grasps are). Clean single-variable resize test vs ..._depth_h24 (the
