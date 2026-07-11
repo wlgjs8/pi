@@ -35,6 +35,24 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
 
 
+def resize_no_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+    """Direct (aspect-distorting) resize to (height, width) with NO padding, using PIL. Unlike
+    resize_with_pad, this stretches the full image to fill the target -- keeps the entire FOV and
+    spends the whole target resolution on the scene, at the cost of distorting the aspect ratio.
+    Same batch semantics ([..., height, width, channel]) as resize_with_pad.
+    """
+    # If the images are already the correct size, return them as is.
+    if images.shape[-3:-1] == (height, width):
+        return images
+
+    original_shape = images.shape
+
+    images = images.reshape(-1, *original_shape[-3:])
+    # PIL uses (width, height) ordering; a plain resize to the target distorts aspect to fill it.
+    resized = np.stack([np.asarray(Image.fromarray(im).resize((width, height), resample=method)) for im in images])
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+
 def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> Image.Image:
     """Replicates tf.image.resize_with_pad for one image using PIL. Resizes an image to a target height and
     width without distortion by padding with zeros.
