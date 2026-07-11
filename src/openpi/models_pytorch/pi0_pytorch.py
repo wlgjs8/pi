@@ -161,8 +161,11 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
+        # config.train_image_aug=False disables the model-internal photometric (brightness/contrast/
+        # saturation) jitter even during training -- for tasks whose cue IS brightness/reflectance.
+        aug = train and getattr(self.config, "train_image_aug", True)
         observation = _preprocessing.preprocess_observation_pytorch(
-            observation, train=train, image_keys=self.config.image_keys
+            observation, train=aug, image_keys=self.config.image_keys
         )
         return (
             list(observation.images.values()),

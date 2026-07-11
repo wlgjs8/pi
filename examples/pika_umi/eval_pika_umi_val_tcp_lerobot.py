@@ -77,6 +77,15 @@ HORIZON = 8
 GRIP_DIMS = (6, 13)
 
 
+def _swap_prompt(s: str) -> str:
+    """COLOR-SWAP a phase_color prompt to test language sensitivity (wiki finding B re-test): swap the
+    bolt color gray<->black AND the coordinated box gray<->green. If the policy READS the color, its
+    output changes under this swap; if it ignores language, the output is ~unchanged."""
+    s = s.replace("gray bolt", "\x00").replace("black bolt", "gray bolt").replace("\x00", "black bolt")
+    s = s.replace("gray box", "\x01").replace("green box", "gray box").replace("\x01", "green box")
+    return s
+
+
 def _load_phase_segmentation():
     path = ROBOTICS_LAB / "policy_runner/policy_runner/phase_segmentation.py"
     spec = importlib.util.spec_from_file_location("phase_segmentation", path)
@@ -127,6 +136,24 @@ def main() -> None:
                              "poses; GT chunk is re-anchored to its first frame (T_t^-1 T_{t+k}) to match the "
                              "model output. anchored row 0 is structurally identity -> first-step metrics use "
                              "row 1 (= T_t^-1 T_{t+1}, comparable to a delta run's first step).")
+    parser.add_argument("--prompt-swap", action="store_true",
+                        help="LANGUAGE-SENSITIVITY test (wiki finding B re-test): per frame, also infer with "
+                             "a COLOR-SWAPPED prompt (gray<->black bolt + gray<->green box) and report the "
+                             "first-step divergence |pred_correct - pred_swapped| (normalized). High = the "
+                             "policy READS the prompt color; ~0 = it ignores language.")
+    parser.add_argument("--swap-noise-floor", action="store_true",
+                        help="CONTROL for --prompt-swap: re-infer with the SAME (unswapped) prompt, so the "
+                             "'divergence' is pure draw-to-draw stochastic noise of the flow head. Compare "
+                             "the real swap divergence against this floor; swap≈floor => the swap metric is "
+                             "just sampling noise, not a language effect.")
+    parser.add_argument("--grounding-probe", type=int, default=0, metavar="K",
+                        help="PROPER color-grounding probe (beats the noisy swap metric). For each frame, draw "
+                             "K action chunks under the CORRECT per-frame prompt and K under the COLOR-SWAPPED "
+                             "prompt, and measure each draw's CHUNK nMSE vs the GROUND-TRUTH demo chunk. Report "
+                             "delta = nMSE(swapped) - nMSE(correct), PAIRED per frame (scene difficulty cancels) "
+                             "and averaged over K draws (kills flow-head sampling noise). delta>0 => the correct "
+                             "color prompt fits the demo better than the swapped one => the policy USES the color "
+                             "word. Compare colorprompt vs a single-prompt baseline. K~8 recommended.")
     args = parser.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
@@ -148,6 +175,12 @@ def main() -> None:
     n_ep = len(ep_from)
     if args.limit:
         n_ep = min(n_ep, args.limit)
+
+    # Per-frame prompt: phase_color writes the per-phase COLOR prompt into each frame's task; legacy
+    # datasets have a single task (== the old fixed PROMPT). Use the dataset task so the eval prompt
+    # MATCHES training (in-distribution) -- the hardcoded PROMPT would be OOD for a phase_color model.
+    _tmap = {int(k): v for k, v in ds.meta.tasks.items()}
+    tasks_all = [_tmap.get(int(i), PROMPT) for i in np.asarray(hf["task_index"])]
 
     # Fixed normalizer from the val GT actions (checkpoint-independent -> comparable across runs).
     action_std = actions_all.std(axis=0)
@@ -225,6 +258,9 @@ def main() -> None:
     GRIP_ARM = {"right": (GRIP_DIMS[1], "right_close", "right_open"),
                 "left": (GRIP_DIMS[0], "left_close", "left_open")}
     infer_times = []
+    swap_div_sq = swap_div_pose_sq = 0.0; swap_div_n = 0  # --prompt-swap: |pred - pred_colorswapped| first-step
+    gp_corr_sq = gp_swap_sq = gp_corr_pose_sq = gp_swap_pose_sq = 0.0  # --grounding-probe: GT-ref chunk SSE
+    gp_h_sum = gp_n = 0
     frame_count = 0
 
     for ei in range(n_ep):
@@ -260,7 +296,7 @@ def main() -> None:
                 "observation/left_wrist_0_rgb": left_img[t],
                 "observation/right_wrist_0_rgb": right_img[t],
                 "observation/state": states[t].astype(np.float32),
-                "prompt": PROMPT,
+                "prompt": tasks_all[a + t],  # per-frame task = the phase_color prompt the model trained on
             }
             if has_depth:
                 obs["observation/left_wrist_0_depth"] = left_depth[t]
@@ -268,11 +304,32 @@ def main() -> None:
             t0 = time.perf_counter()
             pred = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)
             infer_times.append(time.perf_counter() - t0)
+            if args.prompt_swap:  # language-sensitivity: re-infer with the color-swapped prompt
+                # noise-floor control: keep the SAME prompt -> measures draw-to-draw stochastic variance
+                # (the flow head is stochastic) so we can tell how much of the swap divergence is real.
+                sw = dict(obs); sw["prompt"] = obs["prompt"] if args.swap_noise_floor else _swap_prompt(obs["prompt"])
+                pred_sw = np.asarray(policy.infer(sw)["actions"], dtype=np.float64)
+                swap_div_sq += float(((pred[0] - pred_sw[0]) ** 2).sum()); swap_div_n += 1
+                swap_div_pose_sq += float(((pred[0] - pred_sw[0])[POSE_DIMS] ** 2).sum())
             h = min(HORIZON, pred.shape[0], length - t)
             # anchored: build the GT chunk relative to the window's first frame (matches the model output);
             # delta: the stored per-step deltas are already the chunk.
             target = _anchor_relative_chunk(gt[t : t + HORIZON])[:h] if ANCHORED else gt[t : t + h]
             err2 = (pred[:h] - target) ** 2
+            if args.grounding_probe:  # GT-referenced, multi-draw, PAIRED color-grounding probe
+                sw_g = dict(obs)
+                sw_g["prompt"] = obs["prompt"] if args.swap_noise_floor else _swap_prompt(obs["prompt"])
+                cs = ss = csp = ssp = 0.0
+                for _ in range(args.grounding_probe):
+                    pc = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)[:h]
+                    ps = np.asarray(policy.infer(sw_g)["actions"], dtype=np.float64)[:h]
+                    cs += float(((pc - target) ** 2).sum()); ss += float(((ps - target) ** 2).sum())
+                    csp += float(((pc - target)[:, POSE_DIMS] ** 2).sum())
+                    ssp += float(((ps - target)[:, POSE_DIMS] ** 2).sum())
+                K = args.grounding_probe
+                gp_corr_sq += cs / K; gp_swap_sq += ss / K
+                gp_corr_pose_sq += csp / K; gp_swap_pose_sq += ssp / K
+                gp_h_sum += h; gp_n += 1
             # cumulative displacement-from-anchor error (mm/deg) at each horizon step k (only full chunks)
             if h == HORIZON:
                 pe = _displacement_from_anchor(pred[:HORIZON], ANCHORED, ARMS)
@@ -316,7 +373,7 @@ def main() -> None:
                     "observation/left_wrist_0_rgb": left_img[ef],
                     "observation/right_wrist_0_rgb": right_img[ef],
                     "observation/state": states[ef].astype(np.float32),
-                    "prompt": PROMPT,
+                    "prompt": tasks_all[a + ef],
                 }
                 if has_depth:
                     gobs["observation/left_wrist_0_depth"] = left_depth[ef]
@@ -376,6 +433,34 @@ def main() -> None:
             "action_mse": sq_first / max(n_first, 1.0),
             "normalized_action_mse": (sq_first / max(n_first, 1.0)) / scale,
         },
+        "prompt_swap_sensitivity": (
+            {
+                "normalized_full": (swap_div_sq / max(swap_div_n, 1)) / scale,
+                "normalized_pose_only": (swap_div_pose_sq / max(swap_div_n, 1)) / pose_scale,
+                "n": swap_div_n,
+                "note": "first-step |pred - pred_colorswapped|^2 normalized by val action var. ~0 => the "
+                        "policy IGNORES the prompt color (wiki finding B); >0 (esp. pose dims) => it READS it.",
+            }
+            if args.prompt_swap else None
+        ),
+        "grounding_probe": (
+            {
+                "K_draws": args.grounding_probe,
+                "n_frames": gp_n,
+                "swap_was_identity_noisefloor": bool(args.swap_noise_floor),
+                "nmse_correct_pose": (gp_corr_pose_sq / max(gp_h_sum * len(POSE_DIMS), 1)) / pose_scale,
+                "nmse_swapped_pose": (gp_swap_pose_sq / max(gp_h_sum * len(POSE_DIMS), 1)) / pose_scale,
+                "delta_pose": ((gp_swap_pose_sq - gp_corr_pose_sq) / max(gp_h_sum * len(POSE_DIMS), 1)) / pose_scale,
+                "nmse_correct_full": (gp_corr_sq / max(gp_h_sum * actions_all.shape[1], 1)) / scale,
+                "nmse_swapped_full": (gp_swap_sq / max(gp_h_sum * actions_all.shape[1], 1)) / scale,
+                "delta_full": ((gp_swap_sq - gp_corr_sq) / max(gp_h_sum * actions_all.shape[1], 1)) / scale,
+                "note": "GT-referenced CHUNK nMSE; K draws averaged per prompt; PAIRED per frame (scene cancels). "
+                        "delta = swapped - correct; >0 => the correct color prompt fits the demo better than the "
+                        "color-swapped one => policy USES the color word. A single-prompt baseline that ignores "
+                        "color should give delta~0. Compare colorprompt vs baseline delta_pose.",
+            }
+            if args.grounding_probe else None
+        ),
         "per_axis_first_step": {
             # Per-dimension first-step error. RMSE in physical units (translation mm, rotation deg);
             # normalized = per-dim MSE / per-dim GT variance (1.0 == mean-predictor baseline, the worst

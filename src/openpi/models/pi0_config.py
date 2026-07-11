@@ -39,6 +39,14 @@ class Pi0Config(_model.BaseModelConfig):
     # RGB-only checkpoints, which keep the default.
     image_keys: tuple[str, ...] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
+    # If False, the MODEL-INTERNAL train-time image augmentation (preprocess_observation_pytorch /
+    # model.preprocess_observation, applied whenever train=True) is disabled. That aug applies random
+    # brightness(0.7-1.3)/contrast(0.6-1.4)/saturation(0.5-1.5) to every non-depth image -- INDEPENDENT of
+    # the data-pipeline `image_aug` (so image_aug=None does NOT turn it off). Harmful for tasks where the
+    # cue IS brightness/reflectance (black vs shiny-silver bolt): the jitter scrambles exactly that signal.
+    # Default True = unchanged behaviour; set False for the color-grounding A/B.
+    train_image_aug: bool = True
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
