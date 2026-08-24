@@ -251,12 +251,37 @@ def main() -> None:
     pose_sq, pose_n = 0.0, 0.0  # first-step POSE-only (12-dim, gripper excluded) MSE
     perdim_sq = np.zeros(actions_all.shape[1]); perdim_n = 0  # per-dim first-step squared error (raw units^2)
     sq_chunk, n_chunk = 0.0, 0.0
+    # pose-only (12 dim, gripper excluded) FULL-chunk accumulator: the model-side counterpart of
+    # reference_predictors[*].chunk_pose_only_normalized, so model vs trivial baselines are directly
+    # comparable over the whole horizon (first-step alone is dominated by state/action autocorrelation).
+    chunk_pose_sq, chunk_pose_n = 0.0, 0.0
     # CUMULATIVE displacement-from-anchor error at each horizon step (mm / deg), per arm. The fair
     # drift A/B: delta integrates per-step deltas (errors compound) vs anchored predicts T_t^-1 T_{t+k}
     # directly. Normalizer-free; comparable across action_mode at the overlapping horizon range.
     cum_terr = {arm: np.zeros(HORIZON) for arm, _ in ARMS}
     cum_rerr = {arm: np.zeros(HORIZON) for arm, _ in ARMS}
     cum_n = 0
+    # GRASP LOCALIZATION: signed per-axis error of the displacement the model predicts from L steps
+    # BEFORE the grasp to the grasp frame itself -- i.e. "does it put the gripper where the bolt
+    # actually is". Units are mm at the point that decides success. The normalized chunk MSE does not
+    # see this: E1 and veldrop tie at 0.6462 / 0.6464 while their integrated z drift differs 2.7x
+    # (6.29 vs 16.81 mm), and the observed hardware failure is a 5-10 mm z undershoot.
+    # Splitting bias from scatter is the point: a systematic bias is a depth/contact-distribution
+    # problem (fixable in data or with an offset), scatter is a perception-precision problem.
+    GRASP_BOUND = {"right": "b1", "left": "b3"}
+    # 2 and 5 matter more than 12/23: deployment executes 5 rows (167 ms) then replans on a fresh
+    # observation, so L=5 is the operating point. A kNN probe over frozen DINOv3 features -- no
+    # training, no capacity to overfit -- reaches z RMSE 2.1 / 4.5 / 10.2 / 18.9 mm at L=2/5/12/23,
+    # and at every one of those the error equals the disagreement among visually near-identical
+    # frames. So L=23 measures how multi-modal the future is, not how well anything perceives.
+    # Only lookaheads the chunk can actually reach: composing rows 0.._L needs _L <= HORIZON-1.
+    # Without the filter an H=8 config crashes on L=12 (index 12 into an (8,3) displacement array).
+    GRASP_LOOKAHEADS = tuple(sorted(L for L in {2, 5, 12, HORIZON - 1} if L <= HORIZON - 1))
+    # "ep" is recorded so two runs can be compared PAIRED. Comparing two independent scatters over
+    # n=47 wastes most of the power: episode-to-episode difficulty dominates and cancels when the
+    # same episode is differenced. (pad vs no-pad came out 21.05 vs 18.47 mm unpaired = ~0.8 sigma,
+    # which decides nothing.)
+    gloc = {arm: {L: {"pred": [], "gt": [], "ep": []} for L in GRASP_LOOKAHEADS} for arm, _ in ARMS}
     chunk_pos_sq = [0.0] * HORIZON  # normalized action MSE per chunk position (step 0..H-1)
     chunk_pos_n = [0] * HORIZON
     phase_sq = {p: 0.0 for p in phase_mod.PHASE_NAMES}
@@ -361,6 +386,7 @@ def main() -> None:
                     cum_rerr[arm] += (pe[arm][1] * ge[arm][1].inv()).magnitude() * (180.0 / np.pi)
                 cum_n += 1
             sq_chunk += float(err2.sum()); n_chunk += err2.size
+            chunk_pose_sq += float(err2[:, POSE_DIMS].sum()); chunk_pose_n += err2[:, POSE_DIMS].size
             for k in range(h):
                 chunk_pos_sq[k] += float(err2[k].sum()); chunk_pos_n[k] += err2[k].size
             fi = min(FI, h - 1)  # first MEANINGFUL row (anchored row 0 is identity -> use row 1)
@@ -385,6 +411,33 @@ def main() -> None:
         if bounds.clean:
             intz["right"].append(abs(ep_dz["right"]) * args.stride * 1000.0)
             intz["left"].append(abs(ep_dz["left"]) * args.stride * 1000.0)
+            # Grasp localization. Works in BOTH action modes because it goes through
+            # _displacement_from_anchor (delta integrates its predicted deltas, anchored reads the row
+            # directly), unlike grasp_instant_error_mm below which is delta-only. The frame is ee_local
+            # at t -- the delta dataset has no absolute pose, so this is the only frame available to both.
+            for _arm, _ in ARMS:
+                _bf = int(getattr(bounds, GRASP_BOUND[_arm], -1))
+                for _L in GRASP_LOOKAHEADS:
+                    _t0 = _bf - _L
+                    if _t0 < 0 or _t0 + HORIZON > length:
+                        continue
+                    _obs = {
+                        "observation/left_wrist_0_rgb": left_img[_t0],
+                        "observation/right_wrist_0_rgb": right_img[_t0],
+                        "observation/state": states[_t0].astype(np.float32),
+                        "prompt": tasks_all[a + _t0],
+                    }
+                    if has_depth:
+                        _obs["observation/left_wrist_0_depth"] = left_depth[_t0]
+                        _obs["observation/right_wrist_0_depth"] = right_depth[_t0]
+                    _p = np.asarray(policy.infer(_obs)["actions"], dtype=np.float64)
+                    _g = (_anchor_relative_chunk(gt[_t0 : _t0 + HORIZON]) if ANCHORED
+                          else gt[_t0 : _t0 + HORIZON])
+                    gloc[_arm][_L]["pred"].append(
+                        _displacement_from_anchor(_p[:HORIZON], ANCHORED, ARMS)[_arm][0][_L])
+                    gloc[_arm][_L]["gt"].append(
+                        _displacement_from_anchor(_g, ANCHORED, ARMS)[_arm][0][_L])
+                    gloc[_arm][_L]["ep"].append(int(ei))
             # grasp-instant-error uses the row-0 action vs the per-frame GT; for anchored, row 0 is
             # identity and the stored GT is an absolute pose -> not comparable, so skip (N/A). The
             # headline per-axis / per-chunk / pose-only nMSE carry the A/B signal.
@@ -433,6 +486,83 @@ def main() -> None:
                         grip_timing[ev_name].append(abs(pf - gf) * 1000.0 / 30.0)
                         grip_detect[ev_name][0] += 1
         print(f"[{ei + 1}/{n_ep}] episode_{ei:06d} done (frames so far {frame_count})", flush=True)
+
+    # ---- grasp localization summary -------------------------------------------------------------
+    grasp_localization = {}
+    for _arm, _ in ARMS:
+        for _L in GRASP_LOOKAHEADS:
+            P = np.asarray(gloc[_arm][_L]["pred"], dtype=np.float64)
+            G = np.asarray(gloc[_arm][_L]["gt"], dtype=np.float64)
+            if P.shape[0] < 3:
+                continue
+            e = (P - G) * 1000.0          # mm, ee_local at t
+            g = G * 1000.0                # the displacement that actually had to be made
+            var_gt = g.var(axis=0)
+            n = int(P.shape[0])
+            AX = ("x", "y", "z")
+            grasp_localization[f"{_arm}_L{_L}"] = {
+                "n": n,
+                "lookahead_steps": int(_L),
+                # bias vs scatter is the actionable split; stderr says whether the bias is real at n=48
+                "bias_mm": {ax: float(e[:, i].mean()) for i, ax in enumerate(AX)},
+                "bias_stderr_mm": {ax: float(e[:, i].std(ddof=1) / np.sqrt(n)) for i, ax in enumerate(AX)},
+                "scatter_mm": {ax: float(e[:, i].std(ddof=1)) for i, ax in enumerate(AX)},
+                "rmse_mm": {ax: float(np.sqrt((e[:, i] ** 2).mean())) for i, ax in enumerate(AX)},
+                "rmse_norm_mm": float(np.sqrt((np.linalg.norm(e, axis=1) ** 2).mean())),
+                # how much the required displacement varies across episodes = how much there is to get right
+                "gt_spread_mm": {ax: float(np.sqrt(var_gt[i])) for i, ax in enumerate(AX)},
+                # R^2 against the "predict the mean displacement" predictor (that predictor is 0 by
+                # construction), i.e. the fraction of across-episode bolt-position variation captured
+                "r2_vs_mean": {ax: float(1.0 - e[:, i].var() / max(var_gt[i], 1e-12)) for i, ax in enumerate(AX)},
+                # "don't move at all" reference, for scale
+                "zero_motion_rmse_mm": {ax: float(np.sqrt((g[:, i] ** 2).mean())) for i, ax in enumerate(AX)},
+                # Per-event rows for a PAIRED comparison against another checkpoint's json: join on
+                # "episodes" and difference "signed_error_mm" element-wise.
+                "episodes": [int(x) for x in gloc[_arm][_L]["ep"]],
+                "signed_error_mm": [[float(c) for c in row] for row in e],
+                "required_displacement_mm": [[float(c) for c in row] for row in g],
+            }
+
+    # ---- zero-parameter reference predictors, over the SAME windows -------------------------------
+    # Replays the window enumeration above (no inference) so the numbers are directly comparable to the
+    # model's first_step_pose_only_12dim / chunk metrics. Skipped for anchored (state is a velocity, so
+    # constant-velocity extrapolation is not the matching trivial predictor for an absolute-pose target).
+    reference_predictors = None
+    if not ANCHORED:
+        _refs = {"copy_proprio": [0.0, 0.0, 0.0, 0.0], "zero": [0.0, 0.0, 0.0, 0.0],
+                 "mean": [0.0, 0.0, 0.0, 0.0]}  # [first_sq, first_n, chunk_sq, chunk_n]
+        _mean_action = actions_all.mean(axis=0)
+        for ei in range(n_ep):
+            a, b = int(ep_from[ei]), int(ep_to[ei])
+            _gt = actions_all[a : b - 1]
+            for t in range(0, _gt.shape[0] - HORIZON + 1, args.stride):
+                tgt = _gt[t : t + HORIZON][:, POSE_DIMS]
+                h = tgt.shape[0]
+                # state has no gripper in velocity modes; map the 12 velocity dims onto the 12 pose dims.
+                if states_all.shape[1] == len(POSE_DIMS):
+                    cv = states_all[a + t]
+                else:
+                    cv = states_all[a + t][POSE_DIMS]
+                for name, pred_rows in (
+                    ("copy_proprio", np.broadcast_to(cv, (h, len(POSE_DIMS)))),
+                    ("zero", np.zeros((h, len(POSE_DIMS)))),
+                    ("mean", np.broadcast_to(_mean_action[POSE_DIMS], (h, len(POSE_DIMS)))),
+                ):
+                    e2 = (pred_rows - tgt) ** 2
+                    acc = _refs[name]
+                    acc[0] += float(e2[min(FI, h - 1)].sum()); acc[1] += len(POSE_DIMS)
+                    acc[2] += float(e2.sum()); acc[3] += e2.size
+        reference_predictors = {
+            name: {
+                "first_step_pose_only_normalized": (acc[0] / max(acc[1], 1.0)) / pose_scale,
+                "chunk_pose_only_normalized": (acc[2] / max(acc[3], 1.0)) / pose_scale,
+            }
+            for name, acc in _refs.items()
+        }
+        print("\n[reference predictors, pose-only normalized]  "
+              + "  ".join(f"{k}: first={v['first_step_pose_only_normalized']:.4f} "
+                          f"chunk={v['chunk_pose_only_normalized']:.4f}"
+                          for k, v in reference_predictors.items()), flush=True)
 
     result = {
         "checkpoint_step": args.checkpoint_step,
@@ -515,9 +645,26 @@ def main() -> None:
             "note": "12 pose dims (gripper 6,13 excluded), normalized by pose-only val action std -> "
                     "comparable across gripper reps (delta/absolute) and cameras",
         },
+        # MANDATORY CALIBRATION. Read every normalized_action_mse above against these, not against 1.0.
+        # On this dataset the per-step action is ~97% autocorrelated with the velocity proprio
+        # (corr(state, action) = 0.99 on z), so "predict v_{t-1}" scores ~0.31 at FIRST STEP -- i.e. the
+        # first-step metric's useful range is [0.31, 1.0], not [0, 1.0], and a model sitting at ~0.32 is
+        # tied with a zero-parameter extrapolator, not "3x better than the mean". Over the full chunk the
+        # extrapolator collapses (~1.8) while a real policy holds, so CHUNK is the discriminative metric.
+        "reference_predictors": reference_predictors,
+        "reference_predictors_note": "zero-parameter baselines on the same windows/stride/horizon. "
+                                     "copy_proprio = a_hat(t+k) = state(t) for all k (constant-velocity "
+                                     "extrapolation); zero = freeze in place; mean = dataset mean action. "
+                                     "Compare 'first_step'/'chunk' of the model against these.",
         "chunk8": {
             "action_mse": sq_chunk / max(n_chunk, 1.0),
             "normalized_action_mse": (sq_chunk / max(n_chunk, 1.0)) / scale,
+        },
+        "chunk_pose_only_12dim": {
+            "action_mse": chunk_pose_sq / max(chunk_pose_n, 1.0),
+            "normalized_action_mse": (chunk_pose_sq / max(chunk_pose_n, 1.0)) / pose_scale,
+            "note": "full-horizon chunk, 12 pose dims (gripper 6,13 excluded), normalized by pose-only "
+                    "val action std -- directly comparable to reference_predictors[*].chunk_pose_only_normalized",
         },
         "cumulative_position_error": {
             # THE FAIR DRIFT A/B (normalizer-free, comparable across action_mode at overlapping horizon).
@@ -550,6 +697,15 @@ def main() -> None:
         "first_step_by_phase_pose_only_normalized": {  # 12-dim POSE-only (gripper 6,13 excluded), pose_scale
             p: (phase_pose_sq[p] / max(phase_pose_n[p], 1.0)) / pose_scale for p in phase_mod.PHASE_NAMES
         },
+        "grasp_localization": grasp_localization,
+        "grasp_localization_note":
+            "Signed per-axis error of the displacement predicted from L steps BEFORE the grasp to the "
+            "grasp frame, in mm, frame = ee_local at t (NOT world; the delta dataset stores no absolute "
+            "pose). bias = systematic offset (a depth/contact-distribution problem, fixable with data or "
+            "an offset); scatter = per-episode noise (a perception-precision problem). r2_vs_mean is the "
+            "fraction of ACROSS-EPISODE variation in the required displacement that the model captures: "
+            "0 means it predicts the average approach regardless of where the bolt is. Works in both "
+            "action modes (goes through _displacement_from_anchor), unlike grasp_instant_error_mm.",
         "grasp_instant_error_mm": {
             arm: {
                 ax: {

@@ -4,6 +4,7 @@ import re
 from typing import Protocol, runtime_checkable
 
 import flax.traverse_util
+import jax
 import numpy as np
 
 import openpi.models.model as _model
@@ -50,6 +51,8 @@ class CheckpointWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        loaded_params = _interpolate_posemb(loaded_params, params)
+        loaded_params = _slice_trunk_layers(loaded_params, params)
         # Add all missing LoRA weights.
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
@@ -71,6 +74,81 @@ class PaliGemmaWeightLoader(WeightLoader):
         loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+def _interpolate_posemb(loaded_params: at.Params, params: at.Params) -> at.Params:
+    """Resize any learned ViT position embedding whose token count does not match the model.
+
+    SigLIP stores `pos_embedding` as (1, h*w, width) for a fixed patch grid: 14x14=196 at 224,
+    24x24=576 at 384. Training at a new resolution from a 224 checkpoint therefore needs the grid
+    resampled, which is exactly what the released 224->384 SigLIP variants did before fine-tuning.
+    Bicubic on the 2-D grid; the checkpoint is left untouched when the shapes already agree.
+
+    Without this, `_merge_params` copies the 196-token embedding into a 576-token slot purely
+    because the KEY matches -- it never compares shapes -- and the failure would surface far from
+    its cause.
+    """
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    changed = 0
+    for k, v in list(flat_loaded.items()):
+        if not k.endswith("pos_embedding") or k not in flat_ref:
+            continue
+        ref = flat_ref[k]
+        if v.shape == ref.shape:
+            continue
+        n_old, n_new = v.shape[-2], ref.shape[-2]
+        g_old, g_new = int(round(n_old ** 0.5)), int(round(n_new ** 0.5))
+        if g_old * g_old != n_old or g_new * g_new != n_new or v.shape[-1] != ref.shape[-1]:
+            raise ValueError(
+                f"cannot interpolate {k}: {v.shape} -> {ref.shape} (non-square or width mismatch)")
+        width = v.shape[-1]
+        grid = np.asarray(v, dtype=np.float32).reshape(g_old, g_old, width)
+        # jax.image.resize handles the (h, w, c) grid directly and matches the reference impls.
+        out = np.asarray(jax.image.resize(grid, (g_new, g_new, width), method="bicubic"))
+        flat_loaded[k] = out.reshape(1, n_new, width).astype(v.dtype)
+        logging.info("pos_embedding %s interpolated %dx%d -> %dx%d", k, g_old, g_old, g_new, g_new)
+        changed += 1
+    if changed:
+        return flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
+    return loaded_params
+
+
+def _slice_trunk_layers(loaded_params: at.Params, params: at.Params) -> at.Params:
+    """Take a STRIDED subset of a scan-stacked transformer's layers when the model is shallower
+    than the checkpoint.
+
+    openpi stacks the depth axis into leading dimension 0 of every `llm/layers/...` parameter, so a
+    depth-reduced trunk differs from the checkpoint only in that axis. Layers are selected with an
+    even stride rather than truncated: keeping layers 0..5 of an 18-layer stack keeps only the
+    early-feature end of the network, while stride-3 keeps the whole depth-wise progression, which
+    is what layer-dropping work does and what a *dedicated but small* vision stack wants.
+
+    Silent-failure guard: `_merge_params` copies a tensor whenever the KEY matches and never looks
+    at the shape, so without this a 18-layer parameter would be written into a 9-layer slot and the
+    error would surface far from its cause -- the same trap the pos-embedding interpolation exists
+    to close.
+    """
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    picked = None
+    for k, v in list(flat_loaded.items()):
+        if "/layers/" not in k or k not in flat_ref:
+            continue
+        ref = flat_ref[k]
+        if np.ndim(v) == 0 or np.shape(v) == np.shape(ref):
+            continue
+        n_old, n_new = np.shape(v)[0], np.shape(ref)[0]
+        if np.shape(v)[1:] != np.shape(ref)[1:] or n_new >= n_old:
+            raise ValueError(f"cannot slice layers for {k}: {np.shape(v)} -> {np.shape(ref)}")
+        idx = np.linspace(0, n_old - 1, n_new).round().astype(int)
+        if picked is None:
+            picked = idx
+            logging.info("trunk depth %d -> %d, keeping layers %s", n_old, n_new, idx.tolist())
+        flat_loaded[k] = np.asarray(v)[idx]
+    if picked is None:
+        return loaded_params
+    return flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:

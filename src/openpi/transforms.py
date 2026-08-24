@@ -95,10 +95,19 @@ class RepackTransform(DataTransformFn):
     """
 
     structure: at.PyTree[str]
+    # Keys copied through ONLY when the source provides them. Repacking rebuilds the dict from
+    # `structure`, so anything not listed is dropped -- which is how LeRobot's `<feature>_is_pad`
+    # used to disappear before it could reach the loss. Listing it in `structure` instead would
+    # KeyError on every path that has no chunked actions (serving, single-frame datasets).
+    optional: tuple[str, ...] = ()
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        out = jax.tree.map(lambda k: flat_item[k], self.structure)
+        for key in self.optional:
+            if key in flat_item:
+                out[key] = flat_item[key]
+        return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,6 +290,54 @@ def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
     return R.astype(np.float32)
 
 
+# Velocity-proprio dims of the 14-D velocity_grip state (gripper sits at 6/13 and is always kept:
+# it demonstrably works -- velgrip cut the gripper action RMSE from 0.108 to 0.032).
+VELOCITY_STATE_DIMS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
+# Post-normalization sentinel for "this channel is not available". Normalized data lives in [-1, 1]
+# and the pi05 tokenizer discretizes with bins=linspace(-1, 1, 257)[:-1], so any value >1 lands in
+# bin 255. Individually that collides with the ~1% of real samples above q99, but the JOINT pattern
+# of all 12 velocity dims at 255 simultaneously does not occur in real data, which is what makes it
+# a usable "unknown" signature.
+#
+# Why not raw 0 (what `drop_velocity_proprio` does)? Measured against the velgrip_k1 norm stats, raw
+# 0 does NOT land mid-range -- the per-step velocity distributions are asymmetric, so it maps to
+# bins 96..202 (e.g. Lvy q01=-7.9mm/q99=+2.1mm puts raw 0 at bin 202, the 79th percentile). The
+# model therefore reads a perfectly ordinary velocity pattern, not "unknown".
+STATE_UNKNOWN_SENTINEL: float = 1.5
+
+
+@dataclasses.dataclass(frozen=True)
+class MaskStateDims(DataTransformFn):
+    """Replace selected (already normalized) state dims with an out-of-range sentinel.
+
+    Runs AFTER Normalize and BEFORE the tokenizer, so the masked value is what actually gets
+    discretized into the `State:` string of the pi05 prompt. With ``p < 1`` this is a stochastic
+    dropout for training: the model sees both regimes and has to learn a real "no state" branch
+    instead of absorbing a constant. With ``p >= 1`` it is deterministic, which is how inference
+    reproduces the masked arm -- same sentinel, so train and serve agree.
+    """
+
+    dims: tuple[int, ...] = VELOCITY_STATE_DIMS
+    value: float = STATE_UNKNOWN_SENTINEL
+    p: float = 1.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.p <= 0.0 or "state" not in data:
+            return data
+        if self.p < 1.0 and np.random.rand() >= self.p:
+            return data
+        state = np.asarray(data["state"]).copy()
+        keep = [d for d in self.dims if d < state.shape[-1]]
+        if len(keep) != len(self.dims):
+            raise ValueError(
+                f"MaskStateDims expects a state at least {max(self.dims) + 1} wide "
+                f"(velocity_grip is 14), got {state.shape[-1]}"
+            )
+        state[..., keep] = self.value
+        data["state"] = state
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class InjectDartNoise(DataTransformFn):
     """Train-only. Operates on the raw 14-D ``data["state"]`` (reset-relative pose+gripper) and the
@@ -309,6 +366,85 @@ class InjectDartNoise(DataTransformFn):
         data["state"] = state
         data["actions"] = actions
         return data
+
+
+@dataclasses.dataclass(frozen=True)
+class RotAugEgoWrist(DataTransformFn):
+    """Yaw-equivariant augmentation for a wrist-mounted, ego-centric policy (train-only).
+
+    Grasping a bolt is equivariant to rotation about the approach axis, and the UMI wrist camera's
+    optical axis is ~aligned with that axis. So rotating a wrist image about its centre by theta is
+    the SAME demonstration seen from a tool rolled by theta -- provided that arm's targets are
+    rotated to match. Done that way this is not a label-breaking transform: it synthesises the
+    45-90 deg bolt yaw states the demonstrations never contain, which is exactly where a yaw stress
+    probe measured 2x xy degradation.
+
+    Per sample and PER ARM (each wrist camera is rigid to its own tool, so the two angles are
+    independent):
+      image[side]        rotated by +theta about centre
+      pos xy, rotvec xy  rotated by R(-theta)      <- sign pinned empirically by the yaw probe
+      rz                 -= theta / horizon        (the net yaw spread over the chunk)
+      z, gripper         untouched
+      velocity proprio   rotated identically -- image and proprio must tell the same story
+
+    Convention ported verbatim from the VA trainer's rotaug, whose sign was pinned by probe and
+    verified visually with a before/after montage. MUST run before Normalize: normalisation is
+    per-dimension, so rotating after it would mix dims that carry different scales.
+    """
+
+    deg: float = 0.0
+    # (image key, [(i, j) raw-index pairs to rotate], rz index) per arm.
+    arms: tuple = (
+        ("left_wrist_0_rgb", ((0, 1), (3, 4)), 5),
+        ("right_wrist_0_rgb", ((7, 8), (10, 11)), 12),
+    )
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.deg <= 0:
+            return data
+        images = data.get("image")
+        if not isinstance(images, Mapping):
+            return data
+        images = dict(images)
+        state = np.asarray(data["state"], dtype=np.float64).copy() if "state" in data else None
+        actions = np.asarray(data["actions"], dtype=np.float64).copy() if "actions" in data else None
+        for key, pairs, rz in self.arms:
+            if key not in images:
+                continue
+            th = np.random.uniform(-self.deg, self.deg) * np.pi / 180.0
+            images[key] = _rotate_image(np.asarray(images[key]), th)
+            c, s = np.cos(th), np.sin(th)
+            for arr in (state, actions):
+                if arr is None:
+                    continue
+                for i, j in pairs:
+                    if max(i, j) >= arr.shape[-1]:
+                        continue
+                    vi, vj = arr[..., i].copy(), arr[..., j].copy()
+                    arr[..., i] = c * vi + s * vj
+                    arr[..., j] = -s * vi + c * vj
+            if actions is not None and rz < actions.shape[-1]:
+                actions[..., rz] -= th / actions.shape[-2]
+        out = dict(data)
+        out["image"] = images
+        if state is not None:
+            out["state"] = state.astype(np.asarray(data["state"]).dtype)
+        if actions is not None:
+            out["actions"] = actions.astype(np.asarray(data["actions"]).dtype)
+        return out
+
+
+def _rotate_image(img: np.ndarray, th: float) -> np.ndarray:
+    """Rotate HWC by +th radians about the centre, zero fill -- matching torchvision rotate(+deg),
+    the convention the action-sign probe was pinned against."""
+    from PIL import Image
+
+    if th == 0.0:
+        return img
+    mode = "RGB" if img.ndim == 3 and img.shape[-1] == 3 else None
+    pil = Image.fromarray(img.astype(np.uint8)) if mode else Image.fromarray(img.astype(np.uint8))
+    rot = pil.rotate(np.degrees(th), resample=Image.BILINEAR, fillcolor=0)
+    return np.asarray(rot, dtype=img.dtype)
 
 
 @dataclasses.dataclass(frozen=True)

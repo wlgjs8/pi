@@ -68,7 +68,8 @@ class Args:
 
     # If > 1, wrap the policy so each inference samples N action chunks and returns the MEDOID
     # (consensus) chunk — a deployable best-of-N selector that commits to the dominant mode and
-    # reduces per-step mode-switching for multimodal tasks (e.g. the bolt pile). Costs N× inference.
+    # reduces per-step mode-switching for multimodal tasks (e.g. the bolt pile). JAX samples share
+    # one batched model call; non-JAX policies retain sequential sampling.
     num_medoid_samples: int = 1
 
     # torch.compile mode for SERVING (overrides the checkpoint config's model.pytorch_compile_mode).
@@ -152,7 +153,7 @@ def _resolve_config(args: Args):
             raise ValueError(f"Unsupported environment mode: {args.env}")
 
 
-def warmup_policy(policy: _policy.Policy, train_config) -> None:
+def warmup_policy(policy: _policy.Policy, train_config, *, batch_size: int = 1) -> None:
     """Run one fake forward pass so the first real request skips compile/allocation cost.
 
     Builds a fake Observation from the model's ``inputs_spec`` (the exact shapes/dtypes the
@@ -160,7 +161,6 @@ def warmup_policy(policy: _policy.Policy, train_config) -> None:
     (``policy._sample_actions``) with the SAME sample_kwargs, so torch.compile / JAX-jit
     caches the graph that real calls hit. Warms the base Policy before any Medoid/Recorder wrap.
     """
-    obs = train_config.model.fake_obs(batch_size=1)
     sample_kwargs = dict(policy._sample_kwargs)
 
     logging.info("Warming up policy with one fake forward pass...")
@@ -168,23 +168,40 @@ def warmup_policy(policy: _policy.Policy, train_config) -> None:
     if policy._is_pytorch_model:
         import torch
 
+        # Build the fake observation directly on the host. Calling fake_obs() here
+        # creates JAX device arrays and can reserve GPU memory even though serving
+        # uses PyTorch exclusively.
+        observation_spec, _ = train_config.model.inputs_spec(batch_size=1)
+        obs = jax.tree.map(lambda x: np.ones(x.shape, dtype=x.dtype), observation_spec)
         device = policy._pytorch_device
-        obs_t = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)).to(device), obs)
+        obs_t = jax.tree.map(lambda x: torch.from_numpy(np.array(x, copy=True)).to(device), obs)
+
+        # Real PyTorch inference converts model-ready images from BHWC to BCHW in
+        # Observation.from_dict(). The warmup starts from an Observation directly,
+        # so mirror that conversion here before calling sample_actions.
+        obs_t = dataclasses.replace(
+            obs_t,
+            images={key: value.permute(0, 3, 1, 2) for key, value in obs_t.images.items()},
+        )
         with torch.no_grad():
             policy._sample_actions(device, obs_t, **sample_kwargs)
         if "cuda" in str(device):
             torch.cuda.synchronize()
     else:
+        obs = train_config.model.fake_obs(batch_size=batch_size)
         actions = policy._sample_actions(jax.random.key(0), obs, **sample_kwargs)
         jax.block_until_ready(actions)
-    logging.info("Warmup complete in %.1fs", time.monotonic() - t0)
+    logging.info("Warmup complete in %.1fs (batch_size=%d)", time.monotonic() - t0, batch_size)
 
 
 def main(args: Args) -> None:
-    logging.info("Serving with compile_mode=%s, num_medoid_samples=%d", args.compile_mode, args.num_medoid_samples)
+    logging.info(
+        "Serving with compile_mode=%s, num_medoid_samples=%d", args.compile_mode, args.num_medoid_samples
+    )
     policy = create_policy(args)
     if args.warmup:
-        warmup_policy(policy, _resolve_config(args))
+        warmup_batch_size = args.num_medoid_samples if not policy._is_pytorch_model else 1
+        warmup_policy(policy, _resolve_config(args), batch_size=warmup_batch_size)
     if args.num_medoid_samples > 1:
         logging.info("Wrapping policy in MedoidPolicy (num_samples=%d): consensus selection at inference",
                      args.num_medoid_samples)

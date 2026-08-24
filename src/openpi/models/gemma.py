@@ -52,7 +52,8 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora",
+                 "gemma_2b_d9", "gemma_2b_d6", "gemma_300m_d9", "gemma_300m_d6"]
 
 
 def get_config(variant: Variant) -> Config:
@@ -80,6 +81,38 @@ def get_config(variant: Variant) -> Config:
         return Config(
             width=2048,
             depth=18,
+            mlp_dim=16_384,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+        )
+    if variant in ("gemma_300m_d9", "gemma_300m_d6"):
+        # Depth-matched partner for the reduced trunk (gemma.py asserts a shared depth).
+        return Config(
+            width=1024,
+            depth=9 if variant == "gemma_300m_d9" else 6,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+        )
+    if variant in ("gemma_2b_d9", "gemma_2b_d6"):
+        # DEPTH-REDUCED TRUNK. Everything except `depth` matches gemma_2b, so the pretrained
+        # SigLIP->llm projection, the token embedder and the action expert all still load: the
+        # only thing that changes is how many trunk layers process the prefix.
+        #
+        # Why this shape of experiment. C2 removed the trunk entirely and made the pretrained
+        # action expert encode SigLIP tokens itself; its transplant was verified faithful to
+        # 0.0004% and it still came out the worst arm, so what is ruled out is "expert doubles as
+        # the vision encoder", not "a smaller vision stack". These variants keep a DEDICATED stack
+        # in front of the expert -- the expert keeps its trained role of attending to a
+        # trunk-produced KV cache -- and ask how much of it the task actually needs.
+        # Layers are taken STRIDED from the pretrained 18, not truncated, so the depth-wise
+        # progression of the original is preserved rather than keeping only its early layers
+        # (see weight_loaders._slice_trunk_layers).
+        return Config(
+            width=2048,
+            depth=9 if variant == "gemma_2b_d9" else 6,
             mlp_dim=16_384,
             num_heads=8,
             num_kv_heads=1,

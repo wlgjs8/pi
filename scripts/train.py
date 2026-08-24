@@ -148,6 +148,15 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        # Drop chunk rows that LeRobot padded past the end of the episode. Without this the mean
+        # includes rows that are a verbatim repeat of the episode's final action; measured on our
+        # set that is 9.3% of samples, and our terminal frames move at 0.41x the episode median, so
+        # the padding teaches the policy to decelerate and stop. openpi never read this flag (an
+        # `is_pad` grep over the repo returned nothing), which is the same failure mode the DROID
+        # recipe works around with its idle filter.
+        if observation.action_is_pad is not None:
+            keep = jnp.logical_not(observation.action_is_pad).astype(chunked_loss.dtype)
+            return jnp.sum(chunked_loss * keep) / jnp.maximum(jnp.sum(keep), 1.0)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)

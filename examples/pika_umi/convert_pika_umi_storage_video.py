@@ -251,38 +251,45 @@ def _state(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
     ).astype(np.float32)
 
 
-def _arm_velocity(pose) -> np.ndarray:
-    """Per-frame ee_local VELOCITY: vel[t] = the previous executed step (t-1 -> t), in frame[t-1]'s
-    body frame (the SAME ee_local representation as the action's pose delta, just shifted one step so
-    it is the *incoming* motion, i.e. causal proprio). vel[0] = 0 (no prior motion at the segment start).
-    Body-frame (not world) so it is invariant to the unmeasured steamvr->stand transform, exactly like
-    the ee_local action (wiki umi-tcp-delta-frame)."""
-    cur = Rotation.from_quat(pose[:-1, 3:7])  # frame[t-1] = the 'from'
-    nxt = Rotation.from_quat(pose[1:, 3:7])  # frame[t]   = the 'to'
-    pos_delta_local = cur.inv().apply(pose[1:, :3] - pose[:-1, :3])  # (N-1,3) in frame[t-1]
-    rot_delta = (cur.inv() * nxt).as_rotvec()  # (N-1,3)
-    step = np.concatenate([pos_delta_local, rot_delta], axis=1)  # (N-1,6) = vel AT frames 1..N-1
-    return np.vstack([np.zeros((1, 6)), step]).astype(np.float32)  # (N,6); vel[0]=0
+def _arm_velocity(pose, step_frames: int = 1) -> np.ndarray:
+    """Per-frame ee_local VELOCITY: vel[t] = the previous executed step (t-step_frames -> t), in frame
+    [t-step_frames]'s body frame (the SAME ee_local representation as the action's pose delta, just
+    shifted one row so it is the *incoming* motion, i.e. causal proprio). vel[:step_frames] = 0 (no prior
+    motion at the segment start). Body-frame (not world) so it is invariant to the unmeasured
+    steamvr->stand transform, exactly like the ee_local action (wiki umi-tcp-delta-frame).
+
+    `step_frames` MUST equal the action's --action-step-frames so proprio and action share one time base
+    (the model is trained on `action[t] ~ vel[t]`-scale quantities; mixing a 1-frame proprio with a
+    3-frame action silently rescales the proprio channel by 1/3 relative to training)."""
+    k = max(1, int(step_frames))
+    cur = Rotation.from_quat(pose[:-k, 3:7])  # frame[t-k] = the 'from'
+    nxt = Rotation.from_quat(pose[k:, 3:7])  # frame[t]   = the 'to'
+    pos_delta_local = cur.inv().apply(pose[k:, :3] - pose[:-k, :3])  # (N-k,3) in frame[t-k]
+    rot_delta = (cur.inv() * nxt).as_rotvec()  # (N-k,3)
+    step = np.concatenate([pos_delta_local, rot_delta], axis=1)  # (N-k,6) = vel AT frames k..N-1
+    return np.vstack([np.zeros((k, 6)), step]).astype(np.float32)  # (N,6); vel[:k]=0
 
 
-def _state_velocity(left_pose, right_pose) -> np.ndarray:
+def _state_velocity(left_pose, right_pose, step_frames: int = 1) -> np.ndarray:
     """VELOCITY-ONLY proprio (12-D): per arm [pos_vel_local(3), rot_vel(3)]. Fully replaces the 14-D
     reset-relative pose state (no absolute/relative pose, no gripper) -- the proprio carries only how the
     EE is currently moving. Gripper proprio is intentionally dropped (the action still predicts the
     binary gripper). Across a frame-time gap the incoming step is bogus; the caller zeros those rows."""
-    return np.concatenate([_arm_velocity(left_pose), _arm_velocity(right_pose)], axis=1).astype(np.float32)
+    return np.concatenate(
+        [_arm_velocity(left_pose, step_frames), _arm_velocity(right_pose, step_frames)], axis=1
+    ).astype(np.float32)
 
 
-def _state_velocity_grip(left_pose, right_pose, left_grip, right_grip) -> np.ndarray:
+def _state_velocity_grip(left_pose, right_pose, left_grip, right_grip, step_frames: int = 1) -> np.ndarray:
     """VELOCITY + ABSOLUTE-GRIPPER proprio (14-D): per arm [pos_vel_local(3), rot_vel(3), grip/100].
     Same init-pose-independent ee_local velocity as `velocity`, but ADDS the current absolute gripper
     opening back (the velproprio 12-D dropped it). Matches the deploy runtime `proprio_mode=velocity_grip`.
     Across a gap the VELOCITY part is bogus; the caller zeros only the velocity dims (keeps the gripper)."""
     return np.concatenate(
         [
-            _arm_velocity(left_pose),
+            _arm_velocity(left_pose, step_frames),
             (left_grip[:, None] / 100.0),
-            _arm_velocity(right_pose),
+            _arm_velocity(right_pose, step_frames),
             (right_grip[:, None] / 100.0),
         ],
         axis=1,
@@ -421,10 +428,26 @@ def _actions_anchored(left_pose, right_pose, left_grip, right_grip, gripper_acti
     ).astype(np.float32)
 
 
-def _arm_actions(pose, grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
-    cur = Rotation.from_quat(pose[:-1, 3:7])
-    nxt = Rotation.from_quat(pose[1:, 3:7])
-    pos_delta_world = pose[1:, :3] - pose[:-1, :3]
+def _arm_actions(pose, grip, gripper_action: str, binary_th: float = 25.0, step_frames: int = 1) -> np.ndarray:
+    """action[t] = the ee_local SE(3) delta from frame t to frame t+step_frames, in frame t's body frame.
+
+    `step_frames` (--action-step-frames) COARSENS the action time base without decimating the dataset:
+    at K=3 each row spans 3 capture frames (100 ms at 30 Hz) instead of one, so a per-row displacement
+    goes from ~1.2 mm median to ~3.5 mm while the observation rate stays 30 Hz (3x more training samples
+    than decimating the episodes). The point is the variance split: at 1-frame spacing the per-step delta
+    is ~97% autocorrelated with the velocity proprio (corr(state, action) = 0.99 on z), so vision only has
+    to explain ~3% of the action variance; coarsening raises vision's share.
+
+    Rows are consumed K-SPACED, not consecutively -- the loader must stack rows t, t+K, t+2K, ... so they
+    compose without overlap (`DataConfig.action_step_frames` sets delta_timestamps accordingly). Stacking
+    CONSECUTIVE rows of a K>1 dataset triple-counts the motion.
+
+    DEPLOY CONTRACT: `--policy-dt-sec` must become K/fps (K=3 -> 0.1002 s) and every per-row displacement
+    cap on the servo side scales with K (see rb_servo_server delta_twist_max_residual_m)."""
+    k = max(1, int(step_frames))
+    cur = Rotation.from_quat(pose[:-k, 3:7])
+    nxt = Rotation.from_quat(pose[k:, 3:7])
+    pos_delta_world = pose[k:, :3] - pose[:-k, :3]
     pos_delta_local = cur.inv().apply(pos_delta_world)
     rot_delta = (cur.inv() * nxt).as_rotvec()
     # Pose stays an ee_local per-step delta; only the GRIPPER channel switches representation:
@@ -435,18 +458,19 @@ def _arm_actions(pose, grip, gripper_action: str, binary_th: float = 25.0) -> np
     #              at its width) / 1 -> open, via the same absolute path (no deploy change).
     # Proprio gripper stays the absolute current opening in every mode.
     if gripper_action == "binary":
-        grip_col = (grip[1:] >= binary_th).astype(np.float64)[:, None]
+        grip_col = (grip[k:] >= binary_th).astype(np.float64)[:, None]
     elif gripper_action == "absolute":
-        grip_col = (grip[1:] / 100.0)[:, None]
+        grip_col = (grip[k:] / 100.0)[:, None]
     else:
-        grip_col = ((grip[1:] - grip[:-1]) / 100.0)[:, None]
+        grip_col = ((grip[k:] - grip[:-k]) / 100.0)[:, None]
     return np.concatenate([pos_delta_local, rot_delta, grip_col], axis=1).astype(np.float32)
 
 
-def _actions(left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
+def _actions(left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0,
+             step_frames: int = 1) -> np.ndarray:
     return np.concatenate(
-        [_arm_actions(left_pose, left_grip, gripper_action, binary_th),
-         _arm_actions(right_pose, right_grip, gripper_action, binary_th)],
+        [_arm_actions(left_pose, left_grip, gripper_action, binary_th, step_frames),
+         _arm_actions(right_pose, right_grip, gripper_action, binary_th, step_frames)],
         axis=1,
     ).astype(np.float32)
 
@@ -554,6 +578,7 @@ def _episode_frames(
     prompt_mode: str = "single",
     box_colors: dict | None = None,
     emit_color_labels: bool = False,
+    action_step_frames: int = 1,
 ):
     """Read one episode -> (list of SEGMENTS, n_writable_frames).
 
@@ -597,9 +622,9 @@ def _episode_frames(
 
         # Proprio: pose (14-D reset-relative) | velocity (12-D ee_local) | velocity_grip (14-D vel + abs grip).
         if state_mode == "velocity":
-            states = _state_velocity(left_pose, right_pose)
+            states = _state_velocity(left_pose, right_pose, action_step_frames)
         elif state_mode == "velocity_grip":
-            states = _state_velocity_grip(left_pose, right_pose, left_grip, right_grip)
+            states = _state_velocity_grip(left_pose, right_pose, left_grip, right_grip, action_step_frames)
         elif state_mode == "velocity_absrot6d":
             states = _state_velocity_absrot6d(left_pose, right_pose, left_grip, right_grip)
         elif state_mode == "velocity_grav":
@@ -610,27 +635,41 @@ def _episode_frames(
             states = _state(left_pose, right_pose, left_grip, right_grip)
         # Action: per-step ee_local delta (default) | anchored abs-pose-per-frame (UMI-style, relative chunk
         # built at load).
+        K = int(action_step_frames)
         if action_mode == "anchored":
             actions = _actions_anchored(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
         else:
-            actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th)
-        if actions.shape[0] != states.shape[0] - 1:
+            actions = _actions(left_pose, right_pose, left_grip, right_grip, gripper_action, binary_th, K)
+        expected = states.shape[0] - (1 if action_mode == "anchored" else K)
+        if actions.shape[0] != expected:
             raise ValueError("length mismatch")
-        n_act = actions.shape[0]  # writable frames 0..n_act-1; action[t] spans ts[t]->ts[t+1]
+        n_act = actions.shape[0]  # writable frames 0..n_act-1; action[t] spans ts[t]->ts[t+K]
 
-        # Gap transitions: drop frame t when its action delta spans a frame-time gap.
+        # Gap transitions: drop frame t when its action delta spans a frame-time gap. With K>1 the row
+        # covers K capture steps (t..t+K-1), so it is bogus if ANY of them crossed a gap -> rolling OR.
         try:
             ts = np.asarray(f["timestamp"], dtype=np.float64)
-            gap = np.diff(ts)[:n_act] > gap_threshold_s
+            step_gap = np.diff(ts) > gap_threshold_s  # (N-1,) step_gap[i] = (frame i -> i+1 was a gap)
+            gap = np.zeros(n_act, dtype=bool)
+            for _k in range(1 if action_mode == "anchored" else K):
+                gap |= step_gap[_k : _k + n_act]
         except Exception:
+            step_gap = np.zeros(max(states.shape[0] - 1, 0), dtype=bool)
             gap = np.zeros(n_act, dtype=bool)
 
-        # Velocity proprio is the INCOMING step (t-1 -> t): bogus across a gap. The first kept frame of a
-        # post-gap segment has gap[t-1]=True -> zero its velocity (treat a segment start as zero motion).
+        # Velocity proprio is the INCOMING step (t-K -> t): bogus across a gap. Zero the velocity dims of
+        # any frame whose incoming K-frame window crossed a gap (a segment start is zero motion anyway).
         # For velocity_grip, zero ONLY the velocity dims (keep the absolute gripper at 6,13).
         if state_mode in ("velocity", "velocity_grip", "velocity_absrot6d", "velocity_grav", "velocity_rotrel"):
             incoming_gap = np.zeros(states.shape[0], dtype=bool)
-            incoming_gap[1 : 1 + gap.shape[0]] = gap  # incoming_gap[t] = (step t-1 -> t spanned a gap)
+            # incoming_gap[t] = any(step_gap[t-K : t]); frames < K have no full incoming window -> already 0.
+            for _k in range(K):
+                lo = K - _k  # shift: step_gap[t-K+_k] lands at index t
+                if step_gap.shape[0] == 0:
+                    break
+                n_fill = min(states.shape[0] - lo, step_gap.shape[0])
+                if n_fill > 0:
+                    incoming_gap[lo : lo + n_fill] |= step_gap[:n_fill]
             if state_mode == "velocity_rotrel":
                 vel_dims = [0, 1, 2, 7, 8, 9]  # only pos-vel dims/arm (keep rot_rel + grip at 6,13)
                 states[np.ix_(incoming_gap, vel_dims)] = 0.0
@@ -771,6 +810,13 @@ def main(
     depth_z_near_mm: float = 120.0,
     depth_z_far_mm: float = 700.0,
     depth_units_m: float = 1e-4,  # stored-depth count -> metres (Pika D405: 100µm; check collect.log)
+    # Coarsen the ACTION time base without decimating the dataset: each action row spans K capture frames
+    # (K=3 -> 100 ms rows at 30 Hz) while observations stay 30 Hz. Raises vision's share of the action
+    # variance -- at K=1 the per-step delta is ~97% autocorrelated with the velocity proprio, so vision
+    # only has to explain ~3%. The velocity proprio uses the SAME K window (one time base).
+    # Rows must be consumed K-SPACED: set the train config's `action_step_frames` to the same K, and
+    # `--policy-dt-sec K/fps` at deploy. Recorded in meta/pika_umi_convert.json.
+    action_step_frames: int = 1,
     num_shards: int = 1,  # parallelism: N processes each convert episodes where i % num_shards == shard_index
     shard_index: int = 0,  # -> per-shard repo (train+val subset); concat the train shards at train time
 ):
@@ -794,6 +840,23 @@ def main(
         raise ValueError("--action-mode anchored requires --gripper-action absolute or binary (delta is invalid)")
     if arm not in ("dual", "right"):
         raise ValueError(f"--arm must be 'dual' or 'right', got {arm!r}")
+    if int(action_step_frames) < 1:
+        raise ValueError(f"--action-step-frames must be >= 1, got {action_step_frames!r}")
+    if int(action_step_frames) > 1:
+        # Only the two velocity proprio modes thread K into their velocity window; the anchor-carrying
+        # modes (absrot6d/grav/rotrel) and reset-relative `pose` would silently keep a 1-frame velocity
+        # next to a K-frame action -> two time bases in one state vector.
+        if state_mode not in ("velocity", "velocity_grip"):
+            raise ValueError(
+                f"--action-step-frames > 1 requires --state-mode velocity or velocity_grip "
+                f"(got {state_mode!r}); other modes do not share the K-frame velocity window"
+            )
+        if action_mode != "delta":
+            raise ValueError("--action-step-frames > 1 requires --action-mode delta (anchored rows are "
+                             "absolute poses; use the train config's action_step_frames stride instead)")
+        if min_seg_frames <= int(action_step_frames):
+            raise ValueError(f"--min-seg-frames ({min_seg_frames}) must exceed --action-step-frames "
+                             f"({action_step_frames}); a segment shorter than K yields no action row")
     if prompt_mode not in ("single", "phase_color"):
         raise ValueError(f"--prompt-mode must be 'single' or 'phase_color', got {prompt_mode!r}")
     # phase_color: bolt-color -> coordinated box-color map (parse '--box-colors black=green,gray=gray').
@@ -926,6 +989,7 @@ def main(
                     ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
                     gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m, state_mode,
                     action_mode, arm, prompt, prompt_mode, _box_colors_map, emit_color_labels,
+                    action_step_frames,
                 )
                 break
             except Exception as e:
@@ -990,6 +1054,11 @@ def main(
                 "action_mode": action_mode,
                 "arm": arm,
                 "action_dim": action_dim,
+                # DEPLOY CONTRACT for K>1: rows must be stacked K-spaced (train config
+                # `action_step_frames`) and `--policy-dt-sec` must be K/fps, else the chunk is
+                # interpreted at 3x the intended rate.
+                "action_step_frames": int(action_step_frames),
+                "policy_dt_sec_for_deploy": round(int(action_step_frames) / 30.0, 6),
                 "val_from_record": str(val_from_record) if val_from_record is not None else None,
                 "exclude_path_substr": exclude_path_substr,
                 "fisheye_crop_frac": fisheye_crop_frac if crop_frac is not None else None,

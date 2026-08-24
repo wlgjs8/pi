@@ -138,10 +138,14 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # `action_step_frames` (default 1) spaces the stacked rows to match a converter that wrote K-frame
+    # composed deltas -- rows t, t+K, t+2K, ... so they compose without overlap. See DataConfig.
+    step = max(1, int(getattr(data_config, "action_step_frames", 1) or 1))
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            key: [t * step / dataset_meta.fps for t in range(action_horizon)]
+            for key in data_config.action_sequence_keys
         },
         # Force the PyAV decoder for video-backed datasets: the pip torchcodec build's native ops
         # fail to register against our custom torch 2.8.0+cu128 (Blackwell) wheel. PyAV decodes our
@@ -190,8 +194,22 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             *([_transforms.AugmentImages(data_config.image_aug)] if data_config.image_aug is not None else []),
+            # Before Normalize on purpose: normalisation is per-dimension, so rotating x/y
+            # pairs afterwards would mix dims carrying different scales.
+            *([_transforms.RotAugEgoWrist(deg=data_config.rot_aug_deg)]
+              if getattr(data_config, 'rot_aug_deg', 0.0) > 0 else []),
             *([_transforms.InjectDartNoise(data_config.dart_noise)] if data_config.dart_noise is not None else []),
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            # AFTER Normalize so the sentinel is what the pi05 tokenizer discretizes into the
+            # `State:` prompt string, and TRAIN-ONLY: compute_norm_stats builds its own chain from
+            # repack+data_transforms, and serving goes through policy_config, so neither sees this.
+            # The deterministic inference twin lives at the head of model_transforms
+            # (LeRobotPikaUmiDataConfig.mask_velocity_sentinel) and uses the same sentinel value.
+            *(
+                [_transforms.MaskStateDims(p=data_config.velocity_dropout_p)]
+                if data_config.velocity_dropout_p > 0.0
+                else []
+            ),
             *data_config.model_transforms.inputs,
         ],
     )
@@ -220,6 +238,10 @@ def transform_iterable_dataset(
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             *([_transforms.AugmentImages(data_config.image_aug)] if data_config.image_aug is not None else []),
+            # Before Normalize on purpose: normalisation is per-dimension, so rotating x/y
+            # pairs afterwards would mix dims carrying different scales.
+            *([_transforms.RotAugEgoWrist(deg=data_config.rot_aug_deg)]
+              if getattr(data_config, 'rot_aug_deg', 0.0) > 0 else []),
             *([_transforms.InjectDartNoise(data_config.dart_noise)] if data_config.dart_noise is not None else []),
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,

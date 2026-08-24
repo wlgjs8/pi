@@ -83,9 +83,17 @@ class DataConfig:
     # If set, train-only image augmentation applied in the training data pipeline (NOT at
     # inference or norm-stat computation, which build their transform stacks separately).
     image_aug: _transforms.ImageTransformConfig | None = None
+    # Train-only yaw-equivariant wrist augmentation, in DEGREES (0 = off). Rotates each wrist
+    # image about its centre and rotates that arm's targets and velocity proprio to match, so the
+    # image->action correspondence is preserved exactly rather than approximately. See
+    # transforms.RotAugEgoWrist. Injected in the training pipeline only, next to image_aug.
+    rot_aug_deg: float = 0.0
     # If set, train-only DART-style state/action recovery-noise augmentation (covariate-shift /
     # compounding-error fix). Applied in the training pipeline only, on raw state/actions before norm.
     dart_noise: _transforms.DartNoiseConfig | None = None
+    # Train-only stochastic masking of the velocity proprio dims (post-Normalize sentinel). 0 = off.
+    # Inference reproduces the masked arm with `mask_velocity_sentinel`, which uses the same value.
+    velocity_dropout_p: float = 0.0
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
@@ -93,6 +101,13 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Spacing, in dataset frames, between the stacked action-chunk rows. MUST match the converter's
+    # `--action-step-frames`. With the pika_umi K=3 datasets each stored row is already a 3-frame ee_local
+    # delta, so the chunk must take rows t, t+3, t+6, ... -- stacking CONSECUTIVE rows would make
+    # successive rows overlap by 2 frames and triple-count the motion when composed at deploy.
+    # Leave 1 for every legacy (1-frame-delta) dataset.
+    action_step_frames: int = 1
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -108,6 +123,12 @@ class DataConfig:
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         """Create a group."""
+
+
+def _res(model_config) -> tuple[int, int]:
+    """Model input resolution. Train and serve MUST resize to the same size, so both read it
+    from the model config rather than hard-coding 224."""
+    return tuple(getattr(model_config, "image_resolution", (224, 224)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,7 +147,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
+                        _transforms.ResizeImages(*_res(model_config), pad=self.resize_pad),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -138,7 +159,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
+                        _transforms.ResizeImages(*_res(model_config), pad=self.resize_pad),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -158,7 +179,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224, pad=self.resize_pad),
+                        _transforms.ResizeImages(*_res(model_config), pad=self.resize_pad),
                         _transforms.TokenizeFASTInputs(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
@@ -485,6 +506,14 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # purely vision-driven. UMI per-episode-rotated init pose makes reset-relative proprio
     # non-ego-centric; dropping it removes that frame-inconsistent channel. Matches .8 baseline.
     zero_state: bool = False
+    # Deterministic post-Normalize sentinel masking of the velocity dims, applied on EVERY path
+    # (train / eval / serve). This is the inference-side twin of `velocity_dropout_p`. Distinct from
+    # `drop_velocity_proprio`, which zeroes in RAW space and is kept as-is so the existing griponly
+    # checkpoint (E3) still serves exactly as it was trained.
+    mask_velocity_sentinel: bool = False
+    # Probability of masking the velocity dims per training sample (train-only). p=0.5 yields one
+    # checkpoint evaluable BOTH with and without velocity proprio.
+    velocity_dropout_p: float = 0.0
     # If False, use a direct no-pad (aspect-distorting) image resize instead of resize_with_pad —
     # keeps full FOV and spends the whole 224x224 on the scene (more pixels on small bolts). The served
     # config carries this, so train/serve resize stay matched. (center_crop, if set, takes precedence.)
@@ -500,6 +529,18 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
     # (bolt_color_right/left) for the model's auxiliary color head. Needs a phase_color dataset and a
     # model with aux_color_weight > 0. No extra dataset columns (label derived from the prompt string).
     aux_color_labels: bool = False
+    # Spacing (in dataset frames) between stacked action rows; MUST match the converter's
+    # --action-step-frames. K=3 datasets store 3-frame composed deltas, so rows must be taken
+    # K-spaced or the chunk overlaps and triple-counts motion. Deploy needs --policy-dt-sec K/30.
+    action_step_frames: int = 1
+    # Drop the all-zero `base_0_rgb` placeholder slot entirely (no head camera exists in the UMI
+    # captures). Saves 256 SigLIP tokens/step. The model's `image_keys` MUST omit base_0_rgb too.
+    drop_base_image: bool = False
+    # Zero the ee_local velocity dims of a velocity_grip (14-D) state, keeping the gripper at 6/13.
+    # Removes the deploy-time controller-coupled proprio channel; reuses the dataset + norm stats.
+    drop_velocity_proprio: bool = False
+    # Blank the task sentence, keeping the discrete state tokens. See PikaUmiInputs.drop_task_prompt.
+    drop_task_prompt: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -516,8 +557,12 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
         if self.aux_color_labels:
             repack_map["bolt_color_right"] = "bolt_color_right"
             repack_map["bolt_color_left"] = "bolt_color_left"
-        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
-        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state, action_mode=self.action_mode, aux_color_labels=self.aux_color_labels)]
+        repack_transform = _transforms.Group(
+            # LeRobot emits this alongside a delta_timestamps chunk; carried so the loss can mask
+            # episode-boundary padding. Absent at serve time, hence optional.
+            inputs=[_transforms.RepackTransform(repack_map, optional=("actions_is_pad",))]
+        )
+        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state, action_mode=self.action_mode, aux_color_labels=self.aux_color_labels, drop_base_image=self.drop_base_image, drop_velocity_proprio=self.drop_velocity_proprio, drop_task_prompt=self.drop_task_prompt)]
         if self.center_crop is not None:
             data_input_transforms.append(_transforms.CenterCropImages(self.center_crop, self.center_crop))
         data_transforms = _transforms.Group(
@@ -525,12 +570,22 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             outputs=[pika_umi_policy.PikaUmiOutputs(action_dim=7 if self.arm == "right" else 14)],
         )
         model_transforms = ModelTransformFactory(resize_pad=self.resize_pad)(model_config)
+        if self.mask_velocity_sentinel:
+            # Head of model_transforms == right after Normalize, before the tokenizer, on both the
+            # training chain (data_loader.transform_dataset) and the serving chain
+            # (policy_config.create_trained_policy). One code path, so train/serve cannot drift.
+            model_transforms = dataclasses.replace(
+                model_transforms,
+                inputs=(_transforms.MaskStateDims(p=1.0), *model_transforms.inputs),
+            )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_step_frames=self.action_step_frames,
+            velocity_dropout_p=self.velocity_dropout_p,
         )
 
 
@@ -1739,6 +1794,966 @@ _CONFIGS = [
             repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
             assets=AssetsConfig(
                 assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_h24"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # ------------------------------------------------------------------------------------------
+    # 2026-07-27 recipe, from a causal intervention probe against the deployed depth_z50_real@65000
+    # (examples/pika_umi/probe_proprio_shortcut.py, n=220 val frames, flow-head sampling noise floor
+    # measured by drawing `base` twice):
+    #
+    #   * DEPTH DROPPED. Blanking depth to far, to near, to uniform noise, to the RGB image, or swapping
+    #     the two depth cameras all moved the output by 1.02-1.20x the SAMPLING NOISE floor, while greying
+    #     RGB moved it 4.4x. The model consumes depth (omitting the keys raises) and ignores it.
+    #     Mechanism measured on real frames: 8bit/650mm = 2.55mm/level; h264 crf30 costs 4.1mm mean
+    #     (12.8mm p90) on the valid surface inside the grasp patch vs a 2.0mm/frame real descent signal;
+    #     and 27-58% of the grasp patch is invalid depth mapped to 255 (= far = "empty space").
+    #   * base_0_rgb DROPPED. No head camera exists in the UMI captures, so that slot was always an
+    #     all-zero placeholder with mask=False -- excluded from attention but still SigLIP-encoded.
+    #     Wrist-only prefix = 512 image tokens instead of 1280 (depth+base removed).
+    #   * GRIPPER BACK IN PROPRIO (velocity_grip, 14-D). The 12-D velocity state carried no gripper while
+    #     the action gripper is ABSOLUTE, so the opening was decided memorylessly from pixels -> mid-air
+    #     open/close chatter. velgrip norm-stats show gripper action RMSE 0.108 -> 0.032.
+    #
+    # The two configs below are a matched A/B on the ONE remaining open question, the action time base.
+    # Measured on the real UMI val split (deriving K-frame rows by composing the stored 1-frame rows,
+    # exact to 1e-6mm) the trivial "copy the velocity proprio" predictor's pose nMSE floor rises:
+    #     K=1 0.336 | K=2 0.445 | K=3 0.478 | K=4 0.501 | K=5 0.524
+    # i.e. K=3 recovers +42% of trivial-predictability headroom over K=1 and sits at the knee. The
+    # stronger reasons are control-side and also measured: the inference budget
+    # (EXECUTE-EXECUTE/2)*policy_dt goes from ~100-134ms (vs p50 latency 150ms -> late on most chunks)
+    # to 301ms; the Ruckig accel demand af=(d_k+1-d_k)/dt^2 drops ~3x and the jerk-limited dv capacity
+    # j*dt^2/4 grows ~9x (a real log showed the right arm T-slipping on 100% of ticks at 33ms rows).
+    # CONFOUND, stated deliberately: H stays 24 in both, so K also changes the wall-clock horizon
+    # (0.8s -> 2.4s). That is intentional -- "H=24 chunk" is what actually deploys -- but it means a win
+    # cannot be attributed to row rate alone.
+    # DEPLOY for k3: --policy-dt-sec 0.1, --proprio-mode velocity_grip, no --include-depth.
+    # DEPLOY for k1: --policy-dt-sec 0.0334, --proprio-mode velocity_grip, no --include-depth.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_80k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k3_h24_80k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k3",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k3_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=3,  # MUST equal the converter's --action-step-frames
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # E3: same as the k1 run above, but the ee_local VELOCITY proprio dims are zeroed -- only the
+    # absolute gripper opening survives (dims 6/13). Paired with K=1 (not K=3) on purpose: K=1 is the
+    # arm closest to the DEPLOYED baseline, so the ladder baseline -> k1 -> griponly_k1 stays
+    # one-factor-at-a-time; the velocity channel is more load-bearing at K=1 (copy-proprio floor 0.336
+    # vs 0.478, i.e. proprio explains 66% of the target vs 52%) so the intervention is larger and easier
+    # to detect; and the controller coupling being tested is worst at K=1 (167ms replan, 100ms inference
+    # budget vs 150ms latency, chunk-swap defect hit 3x as often). Risk accepted: at K=1 a row is only
+    # ~1.2mm, near what a 224x224 wrist view resolves, so vision alone may simply fail to carry motion
+    # continuity -- a negative result here still tells us the channel is needed, not merely toxic. Motivation is measured, not stylistic: at deploy the velocity proprio is
+    # differenced from the MEASURED robot pose, and the controller delivers only ~0.87 (p50) of the
+    # commanded per-step displacement -- 35% of moving steps under 0.70 -- so the policy's own tracking
+    # shortfall re-enters its next observation. The demonstrations have no such term (a handheld UMI
+    # capture has no servo), and proprio's influence is concentrated in exactly the rows that execute
+    # (zeroing the whole state moves first-step nMSE 0.324 -> 0.676 but the 24-row chunk only
+    # 0.634 -> 0.668). Reuses the k3 dataset AND its norm stats: the mask is applied in PikaUmiInputs,
+    # so no reconversion, and at deploy the SERVER masks -- the client keeps --proprio-mode velocity_grip.
+    # fsdp_devices=4 because this run shares a box whose other GPUs are occupied.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_griponly_k1_h24_80k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+            drop_velocity_proprio=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=4,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_80k_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
+        # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
+        # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # LANGUAGE ABLATION, 2026-08-13. Paired arm of ..._80k_v2 above: byte-identical except
+    # drop_task_prompt=True. The point is to price the language branch directly instead of by
+    # argument. Every prior comparison that touched it (the whole VA line) also swapped the vision
+    # encoder and the trunk at the same time, so "the LLM does not help here" has never been a
+    # single-variable result.
+    #
+    # What is held equal, deliberately: max_token_len stays at the pi05 default 200 in BOTH arms.
+    # Trailing padding is masked out of attention, so shortening it should be information-free -- but
+    # "should be" is not measured, and a 33 h paired run is the wrong place to introduce an unverified
+    # second variable. The latency win from a shorter prompt (98 -> 64 informative tokens, and 200 ->
+    # ~110 max_token_len is available to BOTH arms) is a SERVING-time knob: set it after training and
+    # verify numerically that the actions are unchanged.
+    #
+    # Prediction on record, so the result cannot be rationalised afterwards: no accuracy difference.
+    # The dataset carries one fixed prompt across all 177,945 frames, so the sentence has zero
+    # discriminative content. A significant WIN for the language arm would mean the sentence is acting
+    # as a learned constant bias rather than as language; a significant LOSS would mean it was
+    # actively costing capacity. Either outcome is more interesting than the expected null.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_80k_v2_nolang",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            # Same dataset, same norm stats as the control -- the ablation is upstream of both.
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+            drop_task_prompt=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # RESOLUTION A/B, 2026-07-31. Four training recipes (proprio content x3, action representation x1)
+    # land within 1.2 sigma of each other on grasp localization -- right-arm z scatter is 20.4/21.1/
+    # 20.4/21.1 mm at L23 across all of them, and there is no significant bias anywhere. The plateau is
+    # not a metric artifact: it survives a mm-unit, representation-independent measure at the point that
+    # decides the grasp. So the next variable is the image, not the recipe.
+    #
+    # resize_with_pad on a 480x640 wrist frame scales by 224/640 -> a 168x224 image with 56 rows of
+    # BLACK BAR: a quarter of the model's input carries nothing. resize_no_pad spends all 224 rows on
+    # the scene, i.e. +33% VERTICAL sampling (horizontal is 224/640 either way). The axis that gains
+    # resolution is the axis that fails -- z scatter is 3x worse than the other axes on the right arm.
+    # Cost is a 1.33x vertical aspect distortion the pretrained SigLIP never saw; full fine-tuning has
+    # to absorb it, which is exactly what the paired control below measures.
+    #
+    # 40k not 80k: E1 60k->80k moved val chunk nMSE 0.6453 -> 0.6462 (nothing), so half the run is a
+    # fair screen -- PROVIDED decay_steps is cut to match, otherwise the LR schedule differs too.
+    # The two configs below differ in EXACTLY ONE field (resize_pad); both must be run, because no
+    # existing checkpoint is a valid control (E1 is v1 at 80k with decay_steps=30000).
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_nopad",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+            # THE single variable under test.
+            resize_pad=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # GRIPPER-LOSS ARM, 2026-08-21. Paired with ..._40k_pad (byte-identical except
+    # grip_loss_weight/window). Targets the measured grip pathology: the gripper target is
+    # ~99% predictable as 'current grip - epsilon', so the flow loss is dominated by hold
+    # frames and the model learns to echo proprio instead of deciding from vision. In sim
+    # pi05v1 issues ~7 close commands per episode and ~90% of them grasp nothing.
+    # RESOLUTION ARM (full-frame 392), 2026-08-21. Paired with ..._40k_pad, identical except
+    # image_resolution. Motivated by the closed-loop failure structure, not by offline error:
+    # lateral aim scatter is ~20 mm p50 against an 18.4 mm bolt head, and at 224 that target is
+    # only a few pixels across. Resolution was rejected four times on OFFLINE metrics, which
+    # this project has since shown do not discriminate closed-loop behaviour at all.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_res392",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            # FULL-FRAME 392, not 384. The whole wrist image is resized -- no crop -- so the
+            # FOV is identical to the control and only the sampling density changes.
+            # 392 and not 384 because PaliGemma's SigLIP-So400m uses patch 14 with padding=VALID:
+            # 384/14 = 27.43, so a 384 input silently DROPS the last 6 px on each axis (a real,
+            # if small, FOV loss -- exactly what this arm must not do). 392 = 14 x 28 exactly,
+            # giving a 28x28 = 784-token grid with the full frame covered.
+            # pi05_base's learned pos_embedding is 16x16 = 256 tokens; it is interpolated to
+            # 28x28 at load time (weight_loaders._interpolate_posemb). Prefix image tokens go
+            # 512 -> 1568 for the two wrist cameras, which is what makes this arm expensive.
+            image_resolution=(392, 392),
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    # GRASP-WEIGHTED AIM ARM, 2026-08-21. Paired with ..._40k_pad. Weights the TRANSLATION
+    # dims on the rows around the grip transition, i.e. the approach that decides where the
+    # fingers land. Motivated directly by the closed-loop measurement: successful grasps sit
+    # at 9 mm lateral error, failures at 18 mm, and past 20 mm nothing is ever picked up --
+    # so the rows that set that number deserve more than 1/24 of the gradient. The VA line's
+    # equivalent was its best offline arm; pi05 has never had it.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_graspwt",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            # AIM channel, same transition detector as the gripper arm.
+            # Paired control is ..._40k_pad -- identical except these two fields.
+            pose_loss_weight=3.0,
+            grip_loss_window=4,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    # GEOMETRIC AUG ARM (yaw-equivariant), 2026-08-21. Paired with ..._40k_pad.
+    # The only geometric transform that is EXACT for a wrist-mounted ego-centric policy:
+    # rotating the wrist image about the optical axis is the same demo with the tool rolled,
+    # provided that arm's targets and velocity proprio are rotated to match. A crop or shift
+    # would need scene depth to relabel and is therefore only approximately valid.
+    # Motivation is measured: the demonstrations contain almost no 45-90 deg bolt yaw and a yaw
+    # stress probe measured 2x xy degradation over 30-45 deg -- the same axis as the 18 mm
+    # closed-loop lateral aim error this whole campaign is chasing.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_rotaug",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True, rot_aug_deg=30.0),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    # PHOTOMETRIC AUG ARM, 2026-08-21. Paired with ..._40k_pad.
+    # NOTE what the control already does: preprocess_observation(train=True) ALWAYS applies
+    # ColorJitter(0.3/0.4/0.5) to every image, in every run -- it is not a knob. So this arm is
+    # not 'photometric aug vs none', it is the richer data-pipeline augmentation ON TOP:
+    # hue, gaussian noise and weak motion blur, which the built-in jitter has none of.
+    # Geometry is disabled here (crop_prob=0) so the two aug arms stay single-variable.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_photoaug",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True, image_aug=_transforms.ImageTransformConfig(crop_prob=0.0)),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    # TRUNK-DEPTH ARMS, 2026-08-22. Paired with ..._40k_pad; the only field that changes is
+    # paligemma_variant, i.e. how many trunk layers process the vision+state prefix.
+    #
+    # These exist because C2 has been mis-cited (including by me) as proof that the 2B trunk is
+    # necessary. C2 deleted the trunk and asked the pretrained 300M ACTION EXPERT to encode
+    # SigLIP tokens itself; its transplant was then verified faithful to 0.0004% against
+    # openpi's own JAX expert, so the result is real but narrow: an action decoder trained to
+    # attend to a trunk-produced KV cache is a bad vision encoder. Nothing was ever measured
+    # about a SMALLER dedicated stack. Layers are taken strided from the pretrained 18
+    # (weight_loaders._slice_trunk_layers), and SigLIP, the projection, the embedder and the
+    # expert all stay pretrained and in their original roles.
+    # d9: half depth -- 'how much of the pretrained trunk does the task need?'
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_trunk9",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            paligemma_variant="gemma_2b_d9",
+            # gemma.py:375 asserts every expert shares a depth: pi0 interleaves the trunk
+            # and the action expert in ONE scanned stack, mixing their attention at every
+            # layer, rather than running the trunk to completion first. So a depth-reduced
+            # arm necessarily shortens both; this measures how deep the INTERLEAVED stack
+            # must be, not how much trunk a fixed 18-layer expert needs.
+            action_expert_variant="gemma_300m_d9",
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    # d6: a third of the depth -- the 'small dedicated encoder in front of the expert'
+    # end of the same axis. If d6 holds the aim error, the fast baseline is here.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_trunk6",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            paligemma_variant="gemma_2b_d6",
+            # gemma.py:375 asserts every expert shares a depth: pi0 interleaves the trunk
+            # and the action expert in ONE scanned stack, mixing their attention at every
+            # layer, rather than running the trunk to completion first. So a depth-reduced
+            # arm necessarily shortens both; this measures how deep the INTERLEAVED stack
+            # must be, not how much trunk a fixed 18-layer expert needs.
+            action_expert_variant="gemma_300m_d6",
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_griploss",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            # Transition-weighted gripper loss: see Pi0Config.grip_loss_weight.
+            # Paired control is ..._40k_pad -- identical except these two fields.
+            grip_loss_weight=5.0,
+            grip_loss_window=4,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h24_40k_pad",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # PROPRIO AXIS, pose variant (2026-08-05). Every proprio sweep so far stayed inside the VELOCITY
+    # family (vel+grip / grip-only / stochastic masking) and none moved the metric. This is the
+    # untried axis: reset-relative POSE state (converter state_mode="pose": [pos_rel3, rotvec_rel3,
+    # grip] x2). Hypothesis: the policy currently never knows its own height -- distance-to-table
+    # must come from vision alone -- and z is the failing axis; an explicit reset-relative z gives
+    # the descent a direct geometric reference. Data is IDENTICAL episodes, split seed 0; only the
+    # state channel differs, so comparisons against the velgrip runs are single-variable.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_posegrip_k1_h24_40k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_posegrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_posegrip_k1_h24_40k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # HORIZON A/B, 2026-08-04. Deployment executes 4-6 rows and replans; rows beyond that are never
+    # run, yet at H=24 they carry ~80% of the flow loss -- and they are the rows that CANNOT be
+    # predicted, because the target is genuinely multi-modal that far out. Measured on val: right-arm
+    # z RMSE is 1.04 mm at L=2, 2.68 at L=5, 6.78 at L=12, 20.63 at L=23, and at every one of those
+    # the error equals the disagreement among visually near-identical frames (a kNN over frozen
+    # DINOv3 features hits the same wall). So most of the H=24 loss is spent fitting noise.
+    #
+    # Shortening to H=8 concentrates the loss on rows that actually execute and cuts action-expert
+    # compute, which matters because precision on hardware is now bounded by OBSERVATION AGE, not by
+    # perception: raising CHUNK_EXECUTE_STEPS 4 -> 6 to escape a latency stall moved the last
+    # executed row from 234 ms to 367 ms of staleness and cost ~3.7 -> ~6.3 mm, exactly tracking the
+    # curve above. Anything that buys freshness buys millimetres.
+    #
+    # Single variable vs ..._40k_pad: action_horizon 24 -> 8. Same data, same norm stats (they are
+    # per-dim over actions/state and do not depend on the horizon), same 40k schedule, same fixes.
+    #
+    # Deployment note: EXECUTE=4 + RUNWAY=4 needs exactly 8 rows, so H=8 leaves NO spare tail. The
+    # RTC blend window [d .. H-execute) is empty at d=4, which is fine under RTC_SCHEDULE=zeros
+    # (hard freeze, no mixing) but means a larger EXECUTE cannot be used without also raising H.
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k1_h8_40k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=8,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_pika_umi_wrist_veldrop_k1_h24_80k_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+            # Stochastic velocity-proprio dropout. E3 zeroed the velocity dims deterministically in
+            # RAW space, but measured against these norm stats raw 0 lands at bins 96..202 -- an
+            # ordinary in-distribution velocity pattern, not "unknown" -- so the model had no
+            # contrast to learn a real no-state branch, and the deployed 60k checkpoint undershot z
+            # by 5-10 mm before the grasp. p=0.5 shows both regimes, and the out-of-range sentinel
+            # (bin 255 on all 12 dims at once, which real data never produces) is unambiguous.
+            # Bonus: one checkpoint, two evaluable arms (with / without velocity proprio).
+            velocity_dropout_p=0.5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
+        # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
+        # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_pika_umi_wrist_anchored_k1_h24_80k_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_anchored_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_anchored_k1_h24_80k_v2"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+            # Actions are per-frame ABSOLUTE tool poses; PikaUmiInputs re-expresses each stacked
+            # window as T_t^-1 T_{t+k} at load time. Every row then composes independently onto one
+            # anchor at deploy instead of chaining per-step deltas, so chunk-internal error stops
+            # compounding. Row 0 is identity by construction (effective horizon H-1).
+            action_mode="anchored",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
+        # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
+        # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_pika_umi_wrist_velgrip_k3_h24_80k_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k3",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k3_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=3,  # MUST equal the converter's --action-step-frames
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
+        # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
+        # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=8,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_pika_umi_wrist_griponly_k1_h24_80k_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            # Real action width: average the flow loss over the 14 used dims instead of all 32
+            # zero-padded ones (see Pi0Config.loss_action_dim).
+            loss_action_dim=14,
+            action_horizon=24,
+            image_keys=("left_wrist_0_rgb", "right_wrist_0_rgb"),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velgrip_k1",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_wrist_velgrip_k1_h24_80k"
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_depth=False,
+            drop_base_image=True,
+            action_step_frames=1,
+            drop_velocity_proprio=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
+        # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
+        # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        batch_size=64,
+        save_interval=5000,
+        keep_period=10000,
+        fsdp_devices=4,
+        num_workers=12,
+        checkpoint_base_dir="/home/plaif/workspace/openpi_runs/checkpoints",
+        assets_base_dir="/home/plaif/workspace/openpi_runs/assets",
+        wandb_enabled=False,
+    ),
+    # Horizon-48 variant used by the depth_z50_h48 PyTorch checkpoint.
+    TrainConfig(
+        name="pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_h48",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=48,
+            image_keys=(
+                "base_0_rgb",
+                "left_wrist_0_rgb",
+                "right_wrist_0_rgb",
+                "left_wrist_0_depth",
+                "right_wrist_0_depth",
+            ),
+        ),
+        data=LeRobotPikaUmiDataConfig(
+            repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_velproprio_depth_z50_h48"
             ),
             base_config=DataConfig(prompt_from_task=True),
             include_depth=True,

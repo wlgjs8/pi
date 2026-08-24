@@ -110,6 +110,14 @@ class Observation(Generic[ArrayT]):
     aux_bolt_color_right: at.Int[ArrayT, "*b 1"] | None = None
     aux_bolt_color_left: at.Int[ArrayT, "*b 1"] | None = None
 
+    # Per-chunk-row padding flag straight from LeRobot's `delta_timestamps` lookup: True where the
+    # row fell past the end of the episode and was clamped to the final frame. openpi previously
+    # discarded this (grep for `is_pad` across the repo returned nothing), so ~9.3% of our samples
+    # trained the model on a repeated terminal action -- and our terminal frames move at 0.41x the
+    # episode median, i.e. the tail actively teaches "slow down and stop". Carried here so the
+    # training loss can drop those rows.
+    action_is_pad: at.Bool[ArrayT, "*b ah"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -132,6 +140,8 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             aux_bolt_color_right=data.get("bolt_color_right"),
             aux_bolt_color_left=data.get("bolt_color_left"),
+            # LeRobot names it "<feature>_is_pad"; our action feature is "actions".
+            action_is_pad=data.get("actions_is_pad"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -216,6 +226,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        action_is_pad=observation.action_is_pad,
     )
 
 

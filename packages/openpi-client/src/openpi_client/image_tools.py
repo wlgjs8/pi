@@ -56,3 +56,31 @@ def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: in
     zero_image.paste(resized_image, (pad_width, pad_height))
     assert zero_image.size == (width, height)
     return zero_image
+
+
+def resize_no_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+    """Direct (aspect-DISTORTING) resize to (height, width) with NO padding.
+
+    Counterpart to resize_with_pad, which preserves aspect by fitting the frame inside the target and
+    filling the remainder with black. On a 480x640 wrist frame into 224x224 that fit costs 56 of the
+    224 rows (25% of the model's input carries nothing) and samples vertically at 224/640; this
+    function spends all 224 rows on the scene, i.e. 224/480 vertically = +33% vertical sampling, at
+    the price of a 1.33x anisotropic stretch. Field of view is identical either way -- resize_with_pad
+    does not crop.
+
+    Lives here, next to resize_with_pad, because ResizeImages runs inside CPU DataLoader workers on
+    numpy arrays. openpi.shared.image_tools has a jax.jit'd resize_no_pad for on-device use, but
+    openpi.transforms imports `from openpi_client import image_tools`, so a jax-only definition was
+    unreachable: selecting resize_pad=False raised
+        AttributeError: module 'openpi_client.image_tools' has no attribute 'resize_no_pad'
+    which made every resize_pad=False config unrunnable.
+    """
+    if images.shape[-3:-1] == (height, width):
+        return images
+
+    original_shape = images.shape
+    images = images.reshape(-1, *original_shape[-3:])
+    resized = np.stack(
+        [np.asarray(Image.fromarray(im).resize((width, height), resample=method)) for im in images]
+    )
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])

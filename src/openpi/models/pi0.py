@@ -9,6 +9,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models import rtc_jax as _rtc_jax
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -67,6 +68,22 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.loss_action_dim = config.loss_action_dim
+        self.grip_loss_weight = config.grip_loss_weight
+        self.grip_loss_window = config.grip_loss_window
+        self.grip_dims = tuple(config.grip_dims)
+        self.pose_loss_weight = config.pose_loss_weight
+        self.pose_dims = tuple(config.pose_dims)
+        self.image_resolution = tuple(config.image_resolution)
+        if self.grip_loss_weight is not None or self.pose_loss_weight is not None:
+            # Printed once at construction so the TRAINING LOG proves the knob is live. A patch
+            # that silently fails to apply has burned this project before (velgrip_src swaps
+            # openpi.* but not scripts/train.py, so two runs trained without the fix they were
+            # launched for). Do not trust "it should be on" -- read it in the log.
+            logging.info(
+                "pi0: transition loss ACTIVE grip=%s pose=%s window=%s grip_dims=%s pose_dims=%s",
+                self.grip_loss_weight, self.pose_loss_weight, self.grip_loss_window,
+                self.grip_dims, self.pose_dims)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -193,7 +210,8 @@ class Pi0(_model.BaseModel):
         # Pass image_keys=actual keys (like pi0_fast) so EXTRA image streams (e.g. *_wrist_0_depth from
         # include_depth) survive preprocessing instead of being silently dropped to the default 3 RGB keys.
         observation = _model.preprocess_observation(
-            preprocess_rng, observation, train=train, image_keys=list(observation.images.keys())
+            preprocess_rng, observation, train=train, image_keys=list(observation.images.keys()),
+            image_resolution=self.image_resolution,
         )
 
         batch_shape = actions.shape[:-2]
@@ -215,7 +233,55 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        se = jnp.square(v_t - u_t)
+        if self.loss_action_dim is not None:
+            # Drop the zero-padded tail dims (see Pi0Config.loss_action_dim).
+            se = se[..., : self.loss_action_dim]
+        if self.grip_loss_weight is not None or self.pose_loss_weight is not None:
+            se = se * self._transition_weights(actions, se.shape)
+        return jnp.mean(se, axis=-1)
+
+    def _transition_weights(self, actions, shape):
+        """Per-(row, dim) loss weights that concentrate the gripper channel's gradient on the
+        rows where the gripper actually CHANGES. See Pi0Config.grip_loss_weight for why.
+
+        Returns a tensor broadcastable to `shape` whose mean is 1 per sample, so the loss scale
+        is untouched and only its distribution moves."""
+        ah, ad = shape[-2], shape[-1]
+        dims = [d for d in self.grip_dims if d < ad]
+        if not dims:
+            return jnp.ones(shape, dtype=actions.dtype)
+        g = actions[..., jnp.array(dims)]                       # (*b, ah, n_grip)
+        # Row-to-row change of the ground-truth gripper command; row 0 has no predecessor.
+        d = jnp.abs(g - jnp.concatenate([g[..., :1, :], g[..., :-1, :]], axis=-2))
+        # A transition is any row whose change exceeds a small fraction of the full range.
+        # Grip is normalised to [-1, 1] by the standard transforms, so 0.05 is ~2.5% of travel:
+        # well above quantisation noise, well below a real open/close.
+        hit = (d > 0.05).astype(actions.dtype)
+        # Dilate over +-window rows: the approach frames leading into a grasp carry the same
+        # decision, and a one-frame spike would be too sparse to move the optimiser.
+        w_ = self.grip_loss_window
+        dil = hit
+        for k in range(1, w_ + 1):
+            fwd = jnp.concatenate([hit[..., k:, :], jnp.zeros_like(hit[..., :k, :])], axis=-2)
+            bwd = jnp.concatenate([jnp.zeros_like(hit[..., :k, :]), hit[..., :-k, :]], axis=-2)
+            dil = jnp.maximum(dil, jnp.maximum(fwd, bwd))
+        w = jnp.ones(shape, dtype=actions.dtype)
+        if self.grip_loss_weight is not None:
+            gw = 1.0 + (self.grip_loss_weight - 1.0) * dil       # (*b, ah, n_grip)
+            w = w.at[..., jnp.array(dims)].set(gw)
+        if self.pose_loss_weight is not None:
+            pdims = [d for d in self.pose_dims if d < ad]
+            if pdims:
+                # One detector, two targets: the grip transition marks the grasp, so the same
+                # mask up-weights the TRANSLATION rows that decide where the fingers land.
+                m = jnp.max(dil, axis=-1, keepdims=True)         # (*b, ah, 1)
+                pw = 1.0 + (self.pose_loss_weight - 1.0) * jnp.broadcast_to(
+                    m, (*m.shape[:-1], len(pdims)))
+                w = w.at[..., jnp.array(pdims)].set(pw)
+        # Renormalise per sample so the loss magnitude -- and therefore what the LR means --
+        # is identical to the unweighted run.
+        return w / jnp.mean(w, axis=(-2, -1), keepdims=True)
 
     @override
     def sample_actions(
@@ -225,9 +291,25 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_prev_action_chunk: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_prefix_weights: at.Float[at.Array, "*b ah"] | None = None,
+        rtc_freeze_mask: at.Bool[at.Array, "*b ah"] | None = None,
+        rtc_max_guidance_weight: at.Float[at.Array, "*b"] | None = None,
     ) -> _model.Actions:
+        """Flow sampling; optional Real-Time Chunking (RTC) guided denoising.
+
+        When ``rtc_prev_action_chunk`` is supplied (with host-computed
+        ``rtc_prefix_weights`` / ``rtc_freeze_mask`` — see
+        ``openpi.models.rtc_jax``), the sample freezes the masked rows to the
+        committed plan every Euler step and guides the soft-weighted region
+        toward it (VJP pseudoinverse guidance). With the default ``None`` the
+        loop is unchanged vanilla flow sampling. All RTC inputs are arrays, so
+        toggling delay/schedule values does not retrace the jit — only
+        presence/absence of RTC selects between the two compiled graphs.
+        """
         observation = _model.preprocess_observation(
-            None, observation, train=False, image_keys=list(observation.images.keys())
+            None, observation, train=False, image_keys=list(observation.images.keys()),
+            image_resolution=self.image_resolution,
         )
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -242,8 +324,7 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def velocity(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -272,8 +353,11 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+        def step(carry):
+            x_t, time = carry
+            v_t = velocity(x_t, time)
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
@@ -281,5 +365,25 @@ class Pi0(_model.BaseModel):
             # robust to floating-point error
             return time >= -dt / 2
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+        if rtc_prev_action_chunk is None:
+            x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+            return x_0
+
+        # RTC guided loop — mirrors models_pytorch/rtc.py rtc_sample_openpi:
+        # freeze the committed rows at every step and after the loop; guide the
+        # soft region toward the previous chunk via VJP pseudoinverse guidance.
+        prev = rtc_prev_action_chunk
+        weights = rtc_prefix_weights
+        freeze_mask = rtc_freeze_mask
+        max_gw = rtc_max_guidance_weight if rtc_max_guidance_weight is not None else jnp.float32(5.0)
+
+        def rtc_step(carry):
+            x_t, time = carry
+            x_t = _rtc_jax.freeze_prefix(x_t, prev, freeze_mask)
+            v_t = _rtc_jax.guided_step_velocity(
+                lambda x: velocity(x, time), x_t, time, prev, weights, max_gw
+            )
+            return x_t + dt * v_t, time + dt
+
+        x_0, _ = jax.lax.while_loop(cond, rtc_step, (noise, 1.0))
+        return _rtc_jax.freeze_prefix(x_0, prev, freeze_mask)

@@ -80,22 +80,62 @@ class PikaUmiInputs(transforms.DataTransformFn):
     # If true, parse the phase_color prompt into per-arm bolt-color labels (0=black,1=gray,-1=ignore)
     # and pass them through as `bolt_color_right`/`bolt_color_left` for the model's auxiliary color head.
     aux_color_labels: bool = False
+    # If true, do not emit the `base_0_rgb` slot at all. There is NO third-person/head camera in the
+    # PIKA UMI captures, so that slot has always been an all-zero placeholder with image_mask=False:
+    # excluded from attention, yet SigLIP still encodes it every step (256 wasted tokens = 1/3 of a
+    # wrist-only prefix). Dropping it is free compute/latency, and inference latency is what bounds the
+    # chunk replan budget. Requires the model's `image_keys` to omit base_0_rgb too. Keep False for
+    # PI0_FAST (which masks the placeholder True) and for every legacy checkpoint, whose prefix layout
+    # would otherwise change under it.
+    drop_base_image: bool = False
+    # Zero ONLY the ee_local velocity dims of a `velocity_grip` (14-D) state, keeping the absolute
+    # gripper opening at dims 6/13. Rationale: the velocity channel is fed from the MEASURED robot
+    # motion at deploy, and the controller only delivers ~0.87 of the commanded per-step displacement
+    # (measured p50 over the deploy step logs; 35% of moving steps land under 0.70), so the policy's
+    # own tracking shortfall is fed back into its next observation -- a contractive loop that the
+    # demonstrations never contained (a handheld UMI capture has no servo lag). Zeroing those dims
+    # keeps the gripper feedback (which fixes the mid-air open/close chatter) while removing the
+    # controller-coupled channel entirely.
+    # Implementation note: this masks at TRANSFORM time, so it reuses the velocity_grip dataset AND its
+    # norm stats unchanged, and at deploy the SERVER applies the mask -- the client can keep sending
+    # `--proprio-mode velocity_grip` with no runtime change. The zeroed dims normalize to a constant
+    # (quantile norm is asymmetric, so not exactly 0), which is still information-free.
+    drop_velocity_proprio: bool = False
+    # State dims that carry the absolute gripper opening in the 14-D velocity_grip layout
+    # ([pos_vel3, rot_vel3, grip] per arm, left block then right block).
+    grip_state_dims: tuple[int, ...] = (6, 13)
+    # Blank the TASK SENTENCE while keeping everything else about the language branch intact.
+    # This is the language ablation, and it has to be done here rather than by dropping
+    # `tokenized_prompt`: pi05 sets discrete_state_input=True, so the tokenizer packs the state INTO
+    # the prompt as "Task: {text}, State: {14 ints};\nAction: ". Dropping the whole tokenized prompt
+    # (which Pi0.embed_prefix supports -- it skips the language branch when tokenized_prompt is None)
+    # would therefore remove the STATE as well and stop being a single-variable ablation. Emitting an
+    # empty task string keeps the state tokens, the scaffolding and the token budget identical and
+    # removes only the sentence (measured: 98 -> 64 informative tokens).
+    # Motivation: the dataset carries ONE prompt string across all 177,945 frames and it never varies,
+    # so the text branch is predicted to carry zero discriminative signal. That prediction is the
+    # premise the whole VA (no-LLM) line was built on and it has never been measured directly.
+    drop_task_prompt: bool = False
 
     def __call__(self, data: dict) -> dict:
         left_wrist = _parse_image(data["observation/left_wrist_0_rgb"])
         right_wrist = _parse_image(data["observation/right_wrist_0_rgb"])
-        base_image = np.zeros_like(left_wrist)
 
         images = {
-            "base_0_rgb": base_image,
             "left_wrist_0_rgb": left_wrist,
             "right_wrist_0_rgb": right_wrist,
         }
         image_mask = {
-            "base_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
             "left_wrist_0_rgb": np.True_,
             "right_wrist_0_rgb": np.True_,
         }
+        if not self.drop_base_image:
+            # Zero placeholder, masked off for pi0/pi05 (only pi0-FAST consumes it).
+            images = {"base_0_rgb": np.zeros_like(left_wrist), **images}
+            image_mask = {
+                "base_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                **image_mask,
+            }
         if self.include_depth:
             images["left_wrist_0_depth"] = _parse_image(data["observation/left_wrist_0_depth"])
             images["right_wrist_0_depth"] = _parse_image(data["observation/right_wrist_0_depth"])
@@ -105,6 +145,19 @@ class PikaUmiInputs(transforms.DataTransformFn):
         state = data["observation/state"]
         if self.zero_state:
             state = np.zeros_like(state)  # proprio neutralized -> constant State: tokens, no pose info
+        elif self.drop_velocity_proprio:
+            # Keep ONLY the absolute gripper dims; zero the controller-coupled velocity dims.
+            state = np.asarray(state)
+            keep = [d for d in self.grip_state_dims if d < state.shape[-1]]
+            if len(keep) != len(self.grip_state_dims):
+                raise ValueError(
+                    f"drop_velocity_proprio expects a velocity_grip state with dims "
+                    f"{self.grip_state_dims}, got width {state.shape[-1]} -- the dataset's "
+                    f"--state-mode must be velocity_grip"
+                )
+            masked = np.zeros_like(state)
+            masked[..., keep] = state[..., keep]
+            state = masked
 
         inputs = {
             "state": state,
@@ -117,7 +170,15 @@ class PikaUmiInputs(transforms.DataTransformFn):
             if self.action_mode == "anchored":
                 acts = _anchor_relative_chunk(acts)  # abs-pose chunk -> anchored relative trajectory
             inputs["actions"] = acts
-        if "prompt" in data:
+        # Episode-boundary padding flag for the action chunk (training only; see
+        # Observation.action_is_pad). Passed straight through so the loss can drop those rows.
+        if "actions_is_pad" in data:
+            inputs["actions_is_pad"] = data["actions_is_pad"]
+        if self.drop_task_prompt:
+            # Unconditional: the tokenizer requires a prompt key, and "" yields
+            # "Task: , State: ...;\nAction: " -- state and scaffolding intact, sentence gone.
+            inputs["prompt"] = ""
+        elif "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
         if self.aux_color_labels:
