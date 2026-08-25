@@ -72,18 +72,23 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    import pyarrow.parquet as pq
     from openpi_client import websocket_client_policy
+    import pyarrow.parquet as pq
 
     root = pathlib.Path(args.root)
     rng = np.random.default_rng(args.seed)
-    eps = [json.loads(l) for l in open(root / "meta/episodes.jsonl")]
-    tasks = {int(json.loads(l)["task_index"]): json.loads(l)["task"] for l in open(root / "meta/tasks.jsonl")}
+    eps = [json.loads(l) for l in (root / "meta/episodes.jsonl").read_text().splitlines()]
+    tasks = {
+        int(json.loads(l)["task_index"]): json.loads(l)["task"]
+        for l in (root / "meta/tasks.jsonl").read_text().splitlines()
+    }
 
     # Fixed normalizer: per-dim std over ALL val GT actions (checkpoint-independent), same as fair-eval.
     all_actions = np.concatenate(
-        [np.stack(pq.read_table(p, columns=["actions"])["actions"].to_numpy()) for p in
-         sorted((root / "data").rglob("*.parquet"))]
+        [
+            np.stack(pq.read_table(p, columns=["actions"])["actions"].to_numpy())
+            for p in sorted((root / "data").rglob("*.parquet"))
+        ]
     ).astype(np.float64)
     action_std = all_actions.std(axis=0)
     pose_scale = float(np.mean(np.square(np.maximum(action_std[POSE_DIMS], 1e-12))))
@@ -110,18 +115,21 @@ def main() -> None:
         for f in want:
             if any(f not in vids[k] for k in vids):
                 continue
-            samples.append({
-                "ep": idx, "f": f, "task": task,
-                "state": states[f],
-                "gt": acts[f : f + args.horizon],
-                **{k: vids[k][f] for k in vids},
-            })
+            samples.append(
+                {
+                    "ep": idx,
+                    "f": f,
+                    "task": task,
+                    "state": states[f],
+                    "gt": acts[f : f + args.horizon],
+                    **{k: vids[k][f] for k in vids},
+                }
+            )
     rng.shuffle(samples)
     samples = samples[: args.max_frames]
     print(f"probe frames: {len(samples)} from {len(sel)} episodes")
 
     # ---- the ablations ------------------------------------------------------------------------
-    GREY = None  # lazily sized
 
     def build(s, cond, other):
         obs = {
@@ -159,8 +167,18 @@ def main() -> None:
             raise ValueError(cond)
         return obs
 
-    CONDS = ["base", "base2", "state_zero", "state_shuf", "state_half", "state_double",
-             "depth_far", "rgb_grey", "scene_shuf", "vision_off"]
+    CONDS = [
+        "base",
+        "base2",
+        "state_zero",
+        "state_shuf",
+        "state_half",
+        "state_double",
+        "depth_far",
+        "rgb_grey",
+        "scene_shuf",
+        "vision_off",
+    ]
 
     client = websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     print("server metadata:", client.get_server_metadata())
@@ -177,9 +195,9 @@ def main() -> None:
         if (i + 1) % 25 == 0:
             print(f"  {i+1}/{len(samples)}", flush=True)
 
-    gts = np.stack(gts)                                    # (N,H,14)
-    states = np.stack(states)                              # (N,12)
-    P = {c: np.stack(v) for c, v in preds.items()}          # (N,H,>=14)
+    gts = np.stack(gts)  # (N,H,14)
+    states = np.stack(states)  # (N,12)
+    P = {c: np.stack(v) for c, v in preds.items()}  # (N,H,>=14)
     H = min(args.horizon, gts.shape[1], P["base"].shape[1])
 
     def pose_nmse(pred, target):
@@ -191,8 +209,8 @@ def main() -> None:
     # whole-chunk one: hold the last velocity for all H steps and see whether the policy beats it.
     copy1 = np.zeros((len(states), 1, 14))
     copy1[:, 0, POSE_DIMS] = states
-    copyH = np.repeat(copy1, H, axis=1)                                    # constant-velocity extrapolation
-    zeroH = np.zeros((len(states), H, 14))                                 # freeze in place
+    copyH = np.repeat(copy1, H, axis=1)  # constant-velocity extrapolation
+    zeroH = np.zeros((len(states), H, 14))  # freeze in place
     meanH = np.broadcast_to(all_actions.mean(axis=0), (len(states), H, 14))  # dataset mean action
     refs = {
         "copy-proprio (v_{t-1})": (copy1, copyH),
@@ -209,7 +227,7 @@ def main() -> None:
     for c in CONDS:
         fs = pose_nmse(P[c][:, :1, :], gts[:, :1, :])
         ch = pose_nmse(P[c][:, :H, :], gts[:, :H, :])
-        d = np.sqrt(float((((P[c][:, :H, POSE_DIMS] - base[:, :H, POSE_DIMS]) ** 2).mean())) / pose_scale)
+        d = np.sqrt(float(((P[c][:, :H, POSE_DIMS] - base[:, :H, POSE_DIMS]) ** 2).mean()) / pose_scale)
         rows[c] = dict(first_step=fs, chunk=ch, delta_vs_base=d)
         print(f"{c:14s} {fs:11.4f} {ch:9.4f} {d:24.4f}")
     print("-" * 92)
@@ -236,7 +254,7 @@ def main() -> None:
     print("\nper-axis first-step nMSE (normalized per-dim by that dim's val std):")
     print(f"{'axis':6s} {'model':>9s} {'copy':>9s} {'vision_off':>11s} {'model/copy':>11s}")
     per_axis = {}
-    for j, (nm, d) in enumerate(zip(names, POSE_DIMS)):
+    for j, (nm, d) in enumerate(zip(names, POSE_DIMS, strict=True)):
         var = max(action_std[d] ** 2, 1e-24)
         m = float(((P["base"][:, 0, d] - gts[:, 0, d]) ** 2).mean() / var)
         cp = float(((states[:, j] - gts[:, 0, d]) ** 2).mean() / var)
@@ -245,14 +263,27 @@ def main() -> None:
         print(f"{nm:6s} {m:9.4f} {cp:9.4f} {vo:11.4f} {m/max(cp,1e-9):11.2f}")
 
     if args.out:
-        pathlib.Path(args.out).write_text(json.dumps({
-            "server": {"host": args.host, "port": args.port,
-                       "metadata": {k: str(v) for k, v in (client.get_server_metadata() or {}).items()}},
-            "root": str(root), "n_frames": len(samples), "horizon": H,
-            "pose_scale": pose_scale, "copy_proprio_first_step_nmse": copy_nmse,
-            "conditions": rows, "reference_predictors": ref_rows, "per_axis_first_step": per_axis,
-            "noise_floor_delta": noise,
-        }, indent=1))
+        pathlib.Path(args.out).write_text(
+            json.dumps(
+                {
+                    "server": {
+                        "host": args.host,
+                        "port": args.port,
+                        "metadata": {k: str(v) for k, v in (client.get_server_metadata() or {}).items()},
+                    },
+                    "root": str(root),
+                    "n_frames": len(samples),
+                    "horizon": H,
+                    "pose_scale": pose_scale,
+                    "copy_proprio_first_step_nmse": copy_nmse,
+                    "conditions": rows,
+                    "reference_predictors": ref_rows,
+                    "per_axis_first_step": per_axis,
+                    "noise_floor_delta": noise,
+                },
+                indent=1,
+            )
+        )
         print(f"\nwrote {args.out}")
 
 

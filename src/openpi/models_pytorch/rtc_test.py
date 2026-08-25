@@ -27,9 +27,9 @@ def test_prefix_weights_linear_ramps_one_to_zero() -> None:
     expected = torch.tensor(
         [
             min(1.0, (2 - 1 - 0) / 3 + 1),  # 1.33 -> 1
-            (2 - 1 - 1) / 3 + 1,            # 1.00
-            (2 - 1 - 2) / 3 + 1,            # 0.667
-            (2 - 1 - 3) / 3 + 1,            # 0.333
+            (2 - 1 - 1) / 3 + 1,  # 1.00
+            (2 - 1 - 2) / 3 + 1,  # 0.667
+            (2 - 1 - 3) / 3 + 1,  # 0.333
             max(0.0, (2 - 1 - 4) / 3 + 1),  # 0.0
             max(0.0, (2 - 1 - 5) / 3 + 1),  # -0.33 -> 0
         ]
@@ -82,7 +82,7 @@ def test_freeze_prefix_overwrites_only_first_d() -> None:
     x_t = torch.zeros(6, 2)
     prev = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     out = rtc.freeze_prefix(x_t, prev, inference_delay=3)
-    assert torch.equal(out[:3], prev[:3])          # frozen
+    assert torch.equal(out[:3], prev[:3])  # frozen
     assert torch.equal(out[3:], torch.zeros(3, 2))  # untouched
     # d=0 is a no-op.
     assert torch.equal(rtc.freeze_prefix(x_t, prev, 0), x_t)
@@ -142,14 +142,24 @@ def test_rtc_sample_freezes_prefix_and_inpaints_toward_prev() -> None:
     prev = torch.full((horizon, adim), 3.0)
 
     guided = rtc.rtc_sample(
-        noise, denoise_fn, prev_action_chunk=prev, inference_delay=d,
-        execute_horizon=s, num_steps=5, prefix_attention_schedule="exp",
+        noise,
+        denoise_fn,
+        prev_action_chunk=prev,
+        inference_delay=d,
+        execute_horizon=s,
+        num_steps=5,
+        prefix_attention_schedule="exp",
         max_guidance_weight=5.0,
     )
     unguided = rtc.rtc_sample(
-        noise, denoise_fn, prev_action_chunk=prev, inference_delay=0,
+        noise,
+        denoise_fn,
+        prev_action_chunk=prev,
+        inference_delay=0,
         execute_horizon=horizon,  # prefix_attention_horizon = 0 -> all weights 0
-        num_steps=5, prefix_attention_schedule="exp", max_guidance_weight=5.0,
+        num_steps=5,
+        prefix_attention_schedule="exp",
+        max_guidance_weight=5.0,
     )
 
     # Frozen prefix is pinned exactly to the committed plan.
@@ -206,9 +216,14 @@ def test_rtc_sample_openpi_reduces_to_vanilla_when_guidance_off() -> None:
 
     noise = torch.randn(horizon, adim)
     out = rtc.rtc_sample_openpi(
-        noise, denoise_fn, prev_action_chunk=torch.zeros(horizon, adim),
-        inference_delay=0, execute_horizon=horizon, num_steps=num_steps,
-        prefix_attention_schedule="exp", max_guidance_weight=5.0,
+        noise,
+        denoise_fn,
+        prev_action_chunk=torch.zeros(horizon, adim),
+        inference_delay=0,
+        execute_horizon=horizon,
+        num_steps=num_steps,
+        prefix_attention_schedule="exp",
+        max_guidance_weight=5.0,
     )
 
     # Vanilla openpi Euler (mirrors pi0_pytorch.sample_actions).
@@ -233,13 +248,23 @@ def test_rtc_sample_openpi_freezes_and_inpaints() -> None:
     prev = torch.full((horizon, adim), 3.0)
 
     guided = rtc.rtc_sample_openpi(
-        noise, denoise_fn, prev_action_chunk=prev, inference_delay=d,
-        execute_horizon=s, num_steps=5, prefix_attention_schedule="exp",
+        noise,
+        denoise_fn,
+        prev_action_chunk=prev,
+        inference_delay=d,
+        execute_horizon=s,
+        num_steps=5,
+        prefix_attention_schedule="exp",
         max_guidance_weight=5.0,
     )
     unguided = rtc.rtc_sample_openpi(
-        noise, denoise_fn, prev_action_chunk=prev, inference_delay=0,
-        execute_horizon=horizon, num_steps=5, prefix_attention_schedule="exp",
+        noise,
+        denoise_fn,
+        prev_action_chunk=prev,
+        inference_delay=0,
+        execute_horizon=horizon,
+        num_steps=5,
+        prefix_attention_schedule="exp",
         max_guidance_weight=5.0,
     )
 

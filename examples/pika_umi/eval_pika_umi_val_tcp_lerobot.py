@@ -41,10 +41,13 @@ def _integrate_local(deltas: np.ndarray):
     Returns (H,3) positions and an (H,) Rotation. This is what the DELTA deploy path accumulates -> its
     per-step errors compound here, exactly the drift we want to measure."""
     H = deltas.shape[0]
-    pos = np.zeros((H, 3)); rotvecs = np.zeros((H, 3))
-    cp = np.zeros(3); cr = Rotation.identity()
+    pos = np.zeros((H, 3))
+    rotvecs = np.zeros((H, 3))
+    cp = np.zeros(3)
+    cr = Rotation.identity()
     for k in range(H):
-        pos[k] = cp; rotvecs[k] = cr.as_rotvec()
+        pos[k] = cp
+        rotvecs[k] = cr.as_rotvec()
         cp = cp + cr.apply(deltas[k, :3])
         cr = cr * Rotation.from_rotvec(deltas[k, 3:6])
     return pos, Rotation.from_rotvec(rotvecs)
@@ -83,10 +86,16 @@ def _swap_prompt(s: str) -> str:
     language, the output is ~unchanged. Handles both the SCHEMA prompt (auxcolor: TARGET_BOLT=black
     <-> shiny silver, DESTINATION_BOX=green <-> gray) and the legacy natural-sentence prompt."""
     if "TARGET_BOLT=" in s:  # schema format (auxcolor-v2)
-        s = (s.replace("TARGET_BOLT=black", "\x00").replace("TARGET_BOLT=shiny silver", "TARGET_BOLT=black")
-              .replace("\x00", "TARGET_BOLT=shiny silver"))
-        s = (s.replace("DESTINATION_BOX=green", "\x01").replace("DESTINATION_BOX=gray", "DESTINATION_BOX=green")
-              .replace("\x01", "DESTINATION_BOX=gray"))
+        s = (
+            s.replace("TARGET_BOLT=black", "\x00")
+            .replace("TARGET_BOLT=shiny silver", "TARGET_BOLT=black")
+            .replace("\x00", "TARGET_BOLT=shiny silver")
+        )
+        s = (
+            s.replace("DESTINATION_BOX=green", "\x01")
+            .replace("DESTINATION_BOX=gray", "DESTINATION_BOX=green")
+            .replace("\x01", "DESTINATION_BOX=gray")
+        )
         return s
     s = s.replace("gray bolt", "\x00").replace("black bolt", "gray bolt").replace("\x00", "black bolt")
     s = s.replace("gray box", "\x01").replace("green box", "gray box").replace("\x01", "green box")
@@ -125,52 +134,92 @@ def main() -> None:
     parser.add_argument("--checkpoint-step", type=int, required=True)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--val-repo-id", type=str, default="plaif/pika_umi_video_val_tcp_8020")
-    parser.add_argument("--config", type=str, default="pi05_pika_umi_video_8020",
-                        help="openpi config name to load the checkpoint with (defines transforms + norm stats)")
-    parser.add_argument("--ckpt-base", type=str, required=True,
-                        help="run checkpoint dir holding step subdirs, e.g. .../video_noaug_8to2_h8_40k")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="pi05_pika_umi_video_8020",
+        help="openpi config name to load the checkpoint with (defines transforms + norm stats)",
+    )
+    parser.add_argument(
+        "--ckpt-base",
+        type=str,
+        required=True,
+        help="run checkpoint dir holding step subdirs, e.g. .../video_noaug_8to2_h8_40k",
+    )
     parser.add_argument("--lerobot-home", type=str, default=str(LEROBOT_HOME))
     parser.add_argument("--tag", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None, help="limit number of val episodes (debug)")
-    parser.add_argument("--binding-filter", type=str, default="all", choices=["all", "normal", "swap"],
-                        help="restrict to episodes whose color binding is normal (right->black/left->silver) "
-                             "or swap (right->silver/left->black), from the phase_color prompt. 'all' = both. "
-                             "Run twice (normal, swap) for the per-bucket pose/phase breakdown.")
-    parser.add_argument("--n-select", type=int, default=1,
-                        help="if >1, wrap in MedoidPolicy: sample N chunks/frame and use the consensus "
-                             "(medoid) chunk for all metrics — measures performance WITH best-of-N selection")
-    parser.add_argument("--gripper-action", type=str, default="delta", choices=["delta", "absolute"],
-                        help="gripper action representation: 'delta' (free-run integrates pred*stride) or "
-                             "'absolute' (pred IS the opening /100; reconstruct directly, no integration)")
-    parser.add_argument("--horizon", type=int, default=None,
-                        help="action horizon; default = the config model's action_horizon")
-    parser.add_argument("--action-mode", type=str, default="delta", choices=["delta", "anchored"],
-                        help="MUST match the dataset's --action-mode. 'delta' = stored per-step ee_local "
-                             "deltas (chunk compared as-is). 'anchored' = dataset stores per-frame ABSOLUTE "
-                             "poses; GT chunk is re-anchored to its first frame (T_t^-1 T_{t+k}) to match the "
-                             "model output. anchored row 0 is structurally identity -> first-step metrics use "
-                             "row 1 (= T_t^-1 T_{t+1}, comparable to a delta run's first step).")
-    parser.add_argument("--prompt-swap", action="store_true",
-                        help="LANGUAGE-SENSITIVITY test (wiki finding B re-test): per frame, also infer with "
-                             "a COLOR-SWAPPED prompt (gray<->black bolt + gray<->green box) and report the "
-                             "first-step divergence |pred_correct - pred_swapped| (normalized). High = the "
-                             "policy READS the prompt color; ~0 = it ignores language.")
-    parser.add_argument("--swap-noise-floor", action="store_true",
-                        help="CONTROL for --prompt-swap: re-infer with the SAME (unswapped) prompt, so the "
-                             "'divergence' is pure draw-to-draw stochastic noise of the flow head. Compare "
-                             "the real swap divergence against this floor; swap≈floor => the swap metric is "
-                             "just sampling noise, not a language effect.")
-    parser.add_argument("--grounding-probe", type=int, default=0, metavar="K",
-                        help="PROPER color-grounding probe (beats the noisy swap metric). For each frame, draw "
-                             "K action chunks under the CORRECT per-frame prompt and K under the COLOR-SWAPPED "
-                             "prompt, and measure each draw's CHUNK nMSE vs the GROUND-TRUTH demo chunk. Report "
-                             "delta = nMSE(swapped) - nMSE(correct), PAIRED per frame (scene difficulty cancels) "
-                             "and averaged over K draws (kills flow-head sampling noise). delta>0 => the correct "
-                             "color prompt fits the demo better than the swapped one => the policy USES the color "
-                             "word. Compare colorprompt vs a single-prompt baseline. K~8 recommended.")
+    parser.add_argument(
+        "--binding-filter",
+        type=str,
+        default="all",
+        choices=["all", "normal", "swap"],
+        help="restrict to episodes whose color binding is normal (right->black/left->silver) "
+        "or swap (right->silver/left->black), from the phase_color prompt. 'all' = both. "
+        "Run twice (normal, swap) for the per-bucket pose/phase breakdown.",
+    )
+    parser.add_argument(
+        "--n-select",
+        type=int,
+        default=1,
+        help="if >1, wrap in MedoidPolicy: sample N chunks/frame and use the consensus "
+        "(medoid) chunk for all metrics — measures performance WITH best-of-N selection",
+    )
+    parser.add_argument(
+        "--gripper-action",
+        type=str,
+        default="delta",
+        choices=["delta", "absolute"],
+        help="gripper action representation: 'delta' (free-run integrates pred*stride) or "
+        "'absolute' (pred IS the opening /100; reconstruct directly, no integration)",
+    )
+    parser.add_argument(
+        "--horizon", type=int, default=None, help="action horizon; default = the config model's action_horizon"
+    )
+    parser.add_argument(
+        "--action-mode",
+        type=str,
+        default="delta",
+        choices=["delta", "anchored"],
+        help="MUST match the dataset's --action-mode. 'delta' = stored per-step ee_local "
+        "deltas (chunk compared as-is). 'anchored' = dataset stores per-frame ABSOLUTE "
+        "poses; GT chunk is re-anchored to its first frame (T_t^-1 T_{t+k}) to match the "
+        "model output. anchored row 0 is structurally identity -> first-step metrics use "
+        "row 1 (= T_t^-1 T_{t+1}, comparable to a delta run's first step).",
+    )
+    parser.add_argument(
+        "--prompt-swap",
+        action="store_true",
+        help="LANGUAGE-SENSITIVITY test (wiki finding B re-test): per frame, also infer with "
+        "a COLOR-SWAPPED prompt (gray<->black bolt + gray<->green box) and report the "
+        "first-step divergence |pred_correct - pred_swapped| (normalized). High = the "
+        "policy READS the prompt color; ~0 = it ignores language.",
+    )
+    parser.add_argument(
+        "--swap-noise-floor",
+        action="store_true",
+        help="CONTROL for --prompt-swap: re-infer with the SAME (unswapped) prompt, so the "
+        "'divergence' is pure draw-to-draw stochastic noise of the flow head. Compare "
+        "the real swap divergence against this floor; swap≈floor => the swap metric is "
+        "just sampling noise, not a language effect.",
+    )
+    parser.add_argument(
+        "--grounding-probe",
+        type=int,
+        default=0,
+        metavar="K",
+        help="PROPER color-grounding probe (beats the noisy swap metric). For each frame, draw "
+        "K action chunks under the CORRECT per-frame prompt and K under the COLOR-SWAPPED "
+        "prompt, and measure each draw's CHUNK nMSE vs the GROUND-TRUTH demo chunk. Report "
+        "delta = nMSE(swapped) - nMSE(correct), PAIRED per frame (scene difficulty cancels) "
+        "and averaged over K draws (kills flow-head sampling noise). delta>0 => the correct "
+        "color prompt fits the demo better than the swapped one => the policy USES the color "
+        "word. Compare colorprompt vs a single-prompt baseline. K~8 recommended.",
+    )
     args = parser.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
     from openpi.policies import policy_config as _policy_config
     from openpi.training import config as _config
 
@@ -182,8 +231,8 @@ def main() -> None:
     root = pathlib.Path(args.lerobot_home) / args.val_repo_id
     ds = LeRobotDataset(args.val_repo_id, root=root, video_backend="pyav")
     hf = ds.hf_dataset.with_format("numpy")
-    states_all = np.stack(hf["state"]).astype(np.float64)      # (N,14) reset-relative proprio
-    actions_all = np.stack(hf["actions"]).astype(np.float64)   # (N,14) ee_local deltas, grip /100
+    states_all = np.stack(hf["state"]).astype(np.float64)  # (N,14) reset-relative proprio
+    actions_all = np.stack(hf["actions"]).astype(np.float64)  # (N,14) ee_local deltas, grip /100
     ep_from = list(ds.episode_data_index["from"])
     ep_to = list(ds.episode_data_index["to"])
     n_ep = len(ep_from)
@@ -207,11 +256,9 @@ def main() -> None:
     SINGLE = actions_all.shape[1] == 7
     if SINGLE:
         POSE_DIMS = [0, 1, 2, 3, 4, 5]
-        GRIPS = (6,)
         ARMS = [("right", 0)]
     else:
         POSE_DIMS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
-        GRIPS = (6, 13)
         ARMS = [("left", 0), ("right", 7)]
     pose_scale = float(np.mean(np.square(np.maximum(action_std[POSE_DIMS], 1e-12))))
 
@@ -227,29 +274,39 @@ def main() -> None:
     FI = 1 if ANCHORED else 0  # first-step row index (anchored row 0 == identity, so use row 1)
     if ANCHORED:
         from openpi.policies.pika_umi_policy import _anchor_relative_chunk
+
         # Re-derive the normalizer over the ANCHORED targets (the stored `actions` are abs poses, whose
         # raw std is the world-frame magnitude -> meaningless). Per-dim std over every window's anchored
         # rows -> the typical anchored-displacement scale; checkpoint-independent, comparable across runs.
-        _sm = np.zeros(14); _sq = np.zeros(14); _nn = 0
+        _sm = np.zeros(14)
+        _sq = np.zeros(14)
+        _nn = 0
         for ei in range(n_ep):
-            a, b = int(ep_from[ei]), int(ep_to[ei]); g = actions_all[a : b - 1]
+            a, b = int(ep_from[ei]), int(ep_to[ei])
+            g = actions_all[a : b - 1]
             for t in range(0, g.shape[0] - HORIZON + 1, args.stride):
                 ch = _anchor_relative_chunk(g[t : t + HORIZON]).astype(np.float64)
-                _sm += ch.sum(0); _sq += (ch ** 2).sum(0); _nn += ch.shape[0]
+                _sm += ch.sum(0)
+                _sq += (ch**2).sum(0)
+                _nn += ch.shape[0]
         _mean = _sm / max(_nn, 1)
-        action_std = np.sqrt(np.maximum(_sq / max(_nn, 1) - _mean ** 2, 1e-24))
+        action_std = np.sqrt(np.maximum(_sq / max(_nn, 1) - _mean**2, 1e-24))
         scale = float(np.mean(np.square(np.maximum(action_std, 1e-12))))
         pose_scale = float(np.mean(np.square(np.maximum(action_std[POSE_DIMS], 1e-12))))
-    print(f"horizon={HORIZON} | gripper_action={args.gripper_action} | action_mode={args.action_mode} | config={args.config}")
+    print(
+        f"horizon={HORIZON} | gripper_action={args.gripper_action} | action_mode={args.action_mode} | config={args.config}"
+    )
     policy = _policy_config.create_trained_policy(cfg, str(ckpt_dir))
     if args.n_select > 1:
         from openpi.policies.policy import MedoidPolicy
+
         policy = MedoidPolicy(policy, num_samples=args.n_select)
         print(f"selection: medoid-of-{args.n_select} (consensus best-of-N) — all metrics use the selected chunk")
 
     sq_first, n_first = 0.0, 0.0
     pose_sq, pose_n = 0.0, 0.0  # first-step POSE-only (12-dim, gripper excluded) MSE
-    perdim_sq = np.zeros(actions_all.shape[1]); perdim_n = 0  # per-dim first-step squared error (raw units^2)
+    perdim_sq = np.zeros(actions_all.shape[1])
+    perdim_n = 0  # per-dim first-step squared error (raw units^2)
     sq_chunk, n_chunk = 0.0, 0.0
     # pose-only (12 dim, gripper excluded) FULL-chunk accumulator: the model-side counterpart of
     # reference_predictors[*].chunk_pose_only_normalized, so model vs trivial baselines are directly
@@ -293,13 +350,13 @@ def main() -> None:
     intz = {"right": [], "left": []}
     # gripper open/close TIMING (open-loop free-run) + gripper-delta MSE
     grip_dmse_sq, grip_dmse_n = 0.0, 0.0
-    grip_timing = {ev: [] for ev in phase_mod.EVENT_NAMES}     # |pred_event - gt_event| in ms
+    grip_timing = {ev: [] for ev in phase_mod.EVENT_NAMES}  # |pred_event - gt_event| in ms
     grip_detect = {ev: [0, 0] for ev in phase_mod.EVENT_NAMES}  # [matched, total]
     # arm -> (action gripper dim, close-event name, open-event name); GRIP_DIMS=(left=6, right=13)
-    GRIP_ARM = {"right": (GRIP_DIMS[1], "right_close", "right_open"),
-                "left": (GRIP_DIMS[0], "left_close", "left_open")}
+    GRIP_ARM = {"right": (GRIP_DIMS[1], "right_close", "right_open"), "left": (GRIP_DIMS[0], "left_close", "left_open")}
     infer_times = []
-    swap_div_sq = swap_div_pose_sq = 0.0; swap_div_n = 0  # --prompt-swap: |pred - pred_colorswapped| first-step
+    swap_div_sq = swap_div_pose_sq = 0.0
+    swap_div_n = 0  # --prompt-swap: |pred - pred_colorswapped| first-step
     gp_corr_sq = gp_swap_sq = gp_corr_pose_sq = gp_swap_pose_sq = 0.0  # --grounding-probe: GT-ref chunk SSE
     gp_h_sum = gp_n = 0
     frame_count = 0
@@ -308,23 +365,30 @@ def main() -> None:
         a, b = int(ep_from[ei]), int(ep_to[ei])
         if args.binding_filter != "all":  # per-bucket eval: keep only normal- or swap-binding episodes
             _tk = set(tasks_all[a:b])
-            _bind = "swap" if any(("shiny silver" in t and "ACTIVE_ARM=right" in t)
-                                  or ("black" in t and "ACTIVE_ARM=left" in t) for t in _tk) else "normal"
+            _bind = (
+                "swap"
+                if any(
+                    ("shiny silver" in t and "ACTIVE_ARM=right" in t) or ("black" in t and "ACTIVE_ARM=left" in t)
+                    for t in _tk
+                )
+                else "normal"
+            )
             if _bind != args.binding_filter:
                 continue
         states = states_all[a:b]
         # full-episode per-frame actions: GT[t] is the ee_local delta from t->t+1 (last frame has none)
-        gt = actions_all[a:b - 1]  # (T-1, 14)
+        gt = actions_all[a : b - 1]  # (T-1, 14)
         length = gt.shape[0]
         # Obs gripper opening for phase events lives at state dims 6/13 in the 14-D pose proprio.
         # The velocity-only proprio (state_mode=velocity) is 12-D and carries NO gripper -> zero it,
         # which makes phase boundaries "not clean" and skips the gripper-timing/grasp/phase-MSE blocks.
         # The headline action MSE (first-step / pose-only / per-chunk) is independent of obs gripper.
         if states.shape[1] > max(GRIP_DIMS):
-            left_grip = states[:, GRIP_DIMS[0]] * 100.0   # absolute % for phase events
+            left_grip = states[:, GRIP_DIMS[0]] * 100.0  # absolute % for phase events
             right_grip = states[:, GRIP_DIMS[1]] * 100.0
         else:
-            left_grip = np.zeros(states.shape[0]); right_grip = np.zeros(states.shape[0])
+            left_grip = np.zeros(states.shape[0])
+            right_grip = np.zeros(states.shape[0])
         bounds = phase_mod.extract_phase_boundaries(left_grip, right_grip, length)
 
         left_mp4 = root / "videos/chunk-000/left_wrist_0_rgb" / f"episode_{ei:06d}.mp4"
@@ -354,9 +418,11 @@ def main() -> None:
             if args.prompt_swap:  # language-sensitivity: re-infer with the color-swapped prompt
                 # noise-floor control: keep the SAME prompt -> measures draw-to-draw stochastic variance
                 # (the flow head is stochastic) so we can tell how much of the swap divergence is real.
-                sw = dict(obs); sw["prompt"] = obs["prompt"] if args.swap_noise_floor else _swap_prompt(obs["prompt"])
+                sw = dict(obs)
+                sw["prompt"] = obs["prompt"] if args.swap_noise_floor else _swap_prompt(obs["prompt"])
                 pred_sw = np.asarray(policy.infer(sw)["actions"], dtype=np.float64)
-                swap_div_sq += float(((pred[0] - pred_sw[0]) ** 2).sum()); swap_div_n += 1
+                swap_div_sq += float(((pred[0] - pred_sw[0]) ** 2).sum())
+                swap_div_n += 1
                 swap_div_pose_sq += float(((pred[0] - pred_sw[0])[POSE_DIMS] ** 2).sum())
             h = min(HORIZON, pred.shape[0], length - t)
             # anchored: build the GT chunk relative to the window's first frame (matches the model output);
@@ -370,13 +436,17 @@ def main() -> None:
                 for _ in range(args.grounding_probe):
                     pc = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)[:h]
                     ps = np.asarray(policy.infer(sw_g)["actions"], dtype=np.float64)[:h]
-                    cs += float(((pc - target) ** 2).sum()); ss += float(((ps - target) ** 2).sum())
+                    cs += float(((pc - target) ** 2).sum())
+                    ss += float(((ps - target) ** 2).sum())
                     csp += float(((pc - target)[:, POSE_DIMS] ** 2).sum())
                     ssp += float(((ps - target)[:, POSE_DIMS] ** 2).sum())
                 K = args.grounding_probe
-                gp_corr_sq += cs / K; gp_swap_sq += ss / K
-                gp_corr_pose_sq += csp / K; gp_swap_pose_sq += ssp / K
-                gp_h_sum += h; gp_n += 1
+                gp_corr_sq += cs / K
+                gp_swap_sq += ss / K
+                gp_corr_pose_sq += csp / K
+                gp_swap_pose_sq += ssp / K
+                gp_h_sum += h
+                gp_n += 1
             # cumulative displacement-from-anchor error (mm/deg) at each horizon step k (only full chunks)
             if h == HORIZON:
                 pe = _displacement_from_anchor(pred[:HORIZON], ANCHORED, ARMS)
@@ -385,18 +455,26 @@ def main() -> None:
                     cum_terr[arm] += np.linalg.norm(pe[arm][0] - ge[arm][0], axis=1) * 1000.0
                     cum_rerr[arm] += (pe[arm][1] * ge[arm][1].inv()).magnitude() * (180.0 / np.pi)
                 cum_n += 1
-            sq_chunk += float(err2.sum()); n_chunk += err2.size
-            chunk_pose_sq += float(err2[:, POSE_DIMS].sum()); chunk_pose_n += err2[:, POSE_DIMS].size
+            sq_chunk += float(err2.sum())
+            n_chunk += err2.size
+            chunk_pose_sq += float(err2[:, POSE_DIMS].sum())
+            chunk_pose_n += err2[:, POSE_DIMS].size
             for k in range(h):
-                chunk_pos_sq[k] += float(err2[k].sum()); chunk_pos_n[k] += err2[k].size
+                chunk_pos_sq[k] += float(err2[k].sum())
+                chunk_pos_n[k] += err2[k].size
             fi = min(FI, h - 1)  # first MEANINGFUL row (anchored row 0 is identity -> use row 1)
             first = err2[fi]
-            perdim_sq += err2[fi]; perdim_n += 1   # per-dim first-step squared error
-            sq_first += float(first.sum()); n_first += first.size
-            pose_sq += float(first[POSE_DIMS].sum()); pose_n += len(POSE_DIMS)
+            perdim_sq += err2[fi]
+            perdim_n += 1  # per-dim first-step squared error
+            sq_first += float(first.sum())
+            n_first += first.size
+            pose_sq += float(first[POSE_DIMS].sum())
+            pose_n += len(POSE_DIMS)
             phase = bounds.phase_for_frame(t)
-            phase_sq[phase] += float(first.sum()); phase_n[phase] += first.size
-            phase_pose_sq[phase] += float(first[POSE_DIMS].sum()); phase_pose_n[phase] += len(POSE_DIMS)
+            phase_sq[phase] += float(first.sum())
+            phase_n[phase] += first.size
+            phase_pose_sq[phase] += float(first[POSE_DIMS].sum())
+            phase_pose_n[phase] += len(POSE_DIMS)
             if not SINGLE:  # phase-z-drift + dual-arm gripper bookkeeping (dual-arm dims only)
                 if phase == "right_pick":
                     ep_dz["right"] += float(pred[fi][9] - target[fi][9])
@@ -404,7 +482,8 @@ def main() -> None:
                     ep_dz["left"] += float(pred[fi][2] - target[fi][2])
                 pdg["left"].append(float(pred[fi][GRIP_DIMS[0]]))
                 pdg["right"].append(float(pred[fi][GRIP_DIMS[1]]))
-                grip_dmse_sq += float(first[GRIP_DIMS[0]] + first[GRIP_DIMS[1]]); grip_dmse_n += 2
+                grip_dmse_sq += float(first[GRIP_DIMS[0]] + first[GRIP_DIMS[1]])
+                grip_dmse_n += 2
             sf.append(t)
             frame_count += 1
 
@@ -431,17 +510,14 @@ def main() -> None:
                         _obs["observation/left_wrist_0_depth"] = left_depth[_t0]
                         _obs["observation/right_wrist_0_depth"] = right_depth[_t0]
                     _p = np.asarray(policy.infer(_obs)["actions"], dtype=np.float64)
-                    _g = (_anchor_relative_chunk(gt[_t0 : _t0 + HORIZON]) if ANCHORED
-                          else gt[_t0 : _t0 + HORIZON])
-                    gloc[_arm][_L]["pred"].append(
-                        _displacement_from_anchor(_p[:HORIZON], ANCHORED, ARMS)[_arm][0][_L])
-                    gloc[_arm][_L]["gt"].append(
-                        _displacement_from_anchor(_g, ANCHORED, ARMS)[_arm][0][_L])
+                    _g = _anchor_relative_chunk(gt[_t0 : _t0 + HORIZON]) if ANCHORED else gt[_t0 : _t0 + HORIZON]
+                    gloc[_arm][_L]["pred"].append(_displacement_from_anchor(_p[:HORIZON], ANCHORED, ARMS)[_arm][0][_L])
+                    gloc[_arm][_L]["gt"].append(_displacement_from_anchor(_g, ANCHORED, ARMS)[_arm][0][_L])
                     gloc[_arm][_L]["ep"].append(int(ei))
             # grasp-instant-error uses the row-0 action vs the per-frame GT; for anchored, row 0 is
             # identity and the stored GT is an absolute pose -> not comparable, so skip (N/A). The
             # headline per-axis / per-chunk / pose-only nMSE carry the A/B signal.
-            for arm, (xi, yi, zi, bkey) in (GRASP.items() if not ANCHORED else ()):
+            for arm, (xi, yi, zi, bkey) in GRASP.items() if not ANCHORED else ():
                 ef = int(getattr(bounds, bkey))
                 if not (0 <= ef < length):
                     continue
@@ -455,14 +531,14 @@ def main() -> None:
                     gobs["observation/left_wrist_0_depth"] = left_depth[ef]
                     gobs["observation/right_wrist_0_depth"] = right_depth[ef]
                 gp = np.asarray(policy.infer(gobs)["actions"], dtype=np.float64)[0]
-                for ax, idx in zip("xyz", (xi, yi, zi)):
+                for ax, idx in zip("xyz", (xi, yi, zi), strict=True):
                     grasp_err[arm][ax].append(abs(gp[idx] - gt[ef][idx]) * 1000.0)
             # gripper open/close TIMING: open-loop free-run the predicted gripper from the GT segment
             # start (integrate pred delta * stride), detect close/open with GT-range hysteresis,
             # compare the event frame to the GT event frame (ms).
             gt_grip = {"left": left_grip, "right": right_grip}
             evf = bounds.event_frames()
-            for arm, (gdim, ev_close, ev_open) in GRIP_ARM.items():
+            for arm, (_gdim, ev_close, ev_open) in GRIP_ARM.items():
                 th = phase_mod.gripper_thresholds(gt_grip[arm])
                 if th is None or len(sf) < 2:
                     continue
@@ -495,8 +571,8 @@ def main() -> None:
             G = np.asarray(gloc[_arm][_L]["gt"], dtype=np.float64)
             if P.shape[0] < 3:
                 continue
-            e = (P - G) * 1000.0          # mm, ee_local at t
-            g = G * 1000.0                # the displacement that actually had to be made
+            e = (P - G) * 1000.0  # mm, ee_local at t
+            g = G * 1000.0  # the displacement that actually had to be made
             var_gt = g.var(axis=0)
             n = int(P.shape[0])
             AX = ("x", "y", "z")
@@ -529,8 +605,11 @@ def main() -> None:
     # constant-velocity extrapolation is not the matching trivial predictor for an absolute-pose target).
     reference_predictors = None
     if not ANCHORED:
-        _refs = {"copy_proprio": [0.0, 0.0, 0.0, 0.0], "zero": [0.0, 0.0, 0.0, 0.0],
-                 "mean": [0.0, 0.0, 0.0, 0.0]}  # [first_sq, first_n, chunk_sq, chunk_n]
+        _refs = {
+            "copy_proprio": [0.0, 0.0, 0.0, 0.0],
+            "zero": [0.0, 0.0, 0.0, 0.0],
+            "mean": [0.0, 0.0, 0.0, 0.0],
+        }  # [first_sq, first_n, chunk_sq, chunk_n]
         _mean_action = actions_all.mean(axis=0)
         for ei in range(n_ep):
             a, b = int(ep_from[ei]), int(ep_to[ei])
@@ -550,8 +629,10 @@ def main() -> None:
                 ):
                     e2 = (pred_rows - tgt) ** 2
                     acc = _refs[name]
-                    acc[0] += float(e2[min(FI, h - 1)].sum()); acc[1] += len(POSE_DIMS)
-                    acc[2] += float(e2.sum()); acc[3] += e2.size
+                    acc[0] += float(e2[min(FI, h - 1)].sum())
+                    acc[1] += len(POSE_DIMS)
+                    acc[2] += float(e2.sum())
+                    acc[3] += e2.size
         reference_predictors = {
             name: {
                 "first_step_pose_only_normalized": (acc[0] / max(acc[1], 1.0)) / pose_scale,
@@ -559,10 +640,14 @@ def main() -> None:
             }
             for name, acc in _refs.items()
         }
-        print("\n[reference predictors, pose-only normalized]  "
-              + "  ".join(f"{k}: first={v['first_step_pose_only_normalized']:.4f} "
-                          f"chunk={v['chunk_pose_only_normalized']:.4f}"
-                          for k, v in reference_predictors.items()), flush=True)
+        print(
+            "\n[reference predictors, pose-only normalized]  "
+            + "  ".join(
+                f"{k}: first={v['first_step_pose_only_normalized']:.4f} " f"chunk={v['chunk_pose_only_normalized']:.4f}"
+                for k, v in reference_predictors.items()
+            ),
+            flush=True,
+        )
 
     result = {
         "checkpoint_step": args.checkpoint_step,
@@ -592,9 +677,10 @@ def main() -> None:
                 "normalized_pose_only": (swap_div_pose_sq / max(swap_div_n, 1)) / pose_scale,
                 "n": swap_div_n,
                 "note": "first-step |pred - pred_colorswapped|^2 normalized by val action var. ~0 => the "
-                        "policy IGNORES the prompt color (wiki finding B); >0 (esp. pose dims) => it READS it.",
+                "policy IGNORES the prompt color (wiki finding B); >0 (esp. pose dims) => it READS it.",
             }
-            if args.prompt_swap else None
+            if args.prompt_swap
+            else None
         ),
         "grounding_probe": (
             {
@@ -608,11 +694,12 @@ def main() -> None:
                 "nmse_swapped_full": (gp_swap_sq / max(gp_h_sum * actions_all.shape[1], 1)) / scale,
                 "delta_full": ((gp_swap_sq - gp_corr_sq) / max(gp_h_sum * actions_all.shape[1], 1)) / scale,
                 "note": "GT-referenced CHUNK nMSE; K draws averaged per prompt; PAIRED per frame (scene cancels). "
-                        "delta = swapped - correct; >0 => the correct color prompt fits the demo better than the "
-                        "color-swapped one => policy USES the color word. A single-prompt baseline that ignores "
-                        "color should give delta~0. Compare colorprompt vs baseline delta_pose.",
+                "delta = swapped - correct; >0 => the correct color prompt fits the demo better than the "
+                "color-swapped one => policy USES the color word. A single-prompt baseline that ignores "
+                "color should give delta~0. Compare colorprompt vs baseline delta_pose.",
             }
-            if args.grounding_probe else None
+            if args.grounding_probe
+            else None
         ),
         "per_axis_first_step": {
             # Per-dimension first-step error. RMSE in physical units (translation mm, rotation deg);
@@ -621,29 +708,40 @@ def main() -> None:
             arm: {
                 ax: {
                     "rmse": (
-                        float(np.sqrt(perdim_sq[di] / max(perdim_n, 1)) * (1000.0 if ax in ("x", "y", "z")
-                                else (180.0 / np.pi) if ax in ("rx", "ry", "rz") else 1.0)),
-                        ("mm" if ax in ("x", "y", "z") else "deg" if ax in ("rx", "ry", "rz") else "/100")
+                        float(
+                            np.sqrt(perdim_sq[di] / max(perdim_n, 1))
+                            * (
+                                1000.0
+                                if ax in ("x", "y", "z")
+                                else (180.0 / np.pi)
+                                if ax in ("rx", "ry", "rz")
+                                else 1.0
+                            )
+                        ),
+                        ("mm" if ax in ("x", "y", "z") else "deg" if ax in ("rx", "ry", "rz") else "/100"),
                     )[0],
                     "unit": ("mm" if ax in ("x", "y", "z") else "deg" if ax in ("rx", "ry", "rz") else "frac"),
                     "normalized_mse": float((perdim_sq[di] / max(perdim_n, 1)) / max(action_std[di] ** 2, 1e-24)),
                 }
                 for ax, di in axmap.items()
             }
-            for arm, axmap in ({"right": {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5, "grip": 6}}
-                               if SINGLE else {
-                "left":  {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5, "grip": 6},
-                "right": {"x": 7, "y": 8, "z": 9, "rx": 10, "ry": 11, "rz": 12, "grip": 13},
-            }).items()
+            for arm, axmap in (
+                {"right": {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5, "grip": 6}}
+                if SINGLE
+                else {
+                    "left": {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5, "grip": 6},
+                    "right": {"x": 7, "y": 8, "z": 9, "rx": 10, "ry": 11, "rz": 12, "grip": 13},
+                }
+            ).items()
         },
         "per_axis_note": "first-step per-dim error; rmse is per 30Hz step (translation mm, rotation deg); "
-                         "normalized_mse=MSE/var, 1.0==predicting the mean (worst meaningful)",
+        "normalized_mse=MSE/var, 1.0==predicting the mean (worst meaningful)",
         "first_step_pose_only_12dim": {
             "action_mse": pose_sq / max(pose_n, 1.0),
             "normalized_action_mse": (pose_sq / max(pose_n, 1.0)) / pose_scale,
             "pose_scale": pose_scale,
             "note": "12 pose dims (gripper 6,13 excluded), normalized by pose-only val action std -> "
-                    "comparable across gripper reps (delta/absolute) and cameras",
+            "comparable across gripper reps (delta/absolute) and cameras",
         },
         # MANDATORY CALIBRATION. Read every normalized_action_mse above against these, not against 1.0.
         # On this dataset the per-step action is ~97% autocorrelated with the velocity proprio
@@ -653,9 +751,9 @@ def main() -> None:
         # extrapolator collapses (~1.8) while a real policy holds, so CHUNK is the discriminative metric.
         "reference_predictors": reference_predictors,
         "reference_predictors_note": "zero-parameter baselines on the same windows/stride/horizon. "
-                                     "copy_proprio = a_hat(t+k) = state(t) for all k (constant-velocity "
-                                     "extrapolation); zero = freeze in place; mean = dataset mean action. "
-                                     "Compare 'first_step'/'chunk' of the model against these.",
+        "copy_proprio = a_hat(t+k) = state(t) for all k (constant-velocity "
+        "extrapolation); zero = freeze in place; mean = dataset mean action. "
+        "Compare 'first_step'/'chunk' of the model against these.",
         "chunk8": {
             "action_mse": sq_chunk / max(n_chunk, 1.0),
             "normalized_action_mse": (sq_chunk / max(n_chunk, 1.0)) / scale,
@@ -664,7 +762,7 @@ def main() -> None:
             "action_mse": chunk_pose_sq / max(chunk_pose_n, 1.0),
             "normalized_action_mse": (chunk_pose_sq / max(chunk_pose_n, 1.0)) / pose_scale,
             "note": "full-horizon chunk, 12 pose dims (gripper 6,13 excluded), normalized by pose-only "
-                    "val action std -- directly comparable to reference_predictors[*].chunk_pose_only_normalized",
+            "val action std -- directly comparable to reference_predictors[*].chunk_pose_only_normalized",
         },
         "cumulative_position_error": {
             # THE FAIR DRIFT A/B (normalizer-free, comparable across action_mode at overlapping horizon).
@@ -672,7 +770,7 @@ def main() -> None:
             # per-step deltas (errors compound) vs anchored predicts T_t^-1 T_{t+k} directly. Compare A's
             # and B's translation_mm[k] / rotation_deg[k] curves over k=0..min(H_A,H_B)-1.
             "note": "mean over windows; translation mm, rotation deg; index k = displacement to frame t+k "
-                    "(k=0 is the anchor, ~0). delta integrates predicted deltas; anchored is direct.",
+            "(k=0 is the anchor, ~0). delta integrates predicted deltas; anchored is direct.",
             "windows": cum_n,
             **{
                 f"{arm}_translation_mm": [float(cum_terr[arm][k] / max(cum_n, 1)) for k in range(HORIZON)]
@@ -683,9 +781,7 @@ def main() -> None:
                 for arm, _ in ARMS
             },
         },
-        "chunk_by_position_normalized": [
-            (chunk_pos_sq[k] / max(chunk_pos_n[k], 1.0)) / scale for k in range(HORIZON)
-        ],
+        "chunk_by_position_normalized": [(chunk_pos_sq[k] / max(chunk_pos_n[k], 1.0)) / scale for k in range(HORIZON)],
         "chunk_by_position_note": (
             "normalized action MSE at each predicted chunk step 0..H-1 (step 0 == first_step); "
             "evaluated over all stride frames of every val episode; rising across positions = "
@@ -698,14 +794,13 @@ def main() -> None:
             p: (phase_pose_sq[p] / max(phase_pose_n[p], 1.0)) / pose_scale for p in phase_mod.PHASE_NAMES
         },
         "grasp_localization": grasp_localization,
-        "grasp_localization_note":
-            "Signed per-axis error of the displacement predicted from L steps BEFORE the grasp to the "
-            "grasp frame, in mm, frame = ee_local at t (NOT world; the delta dataset stores no absolute "
-            "pose). bias = systematic offset (a depth/contact-distribution problem, fixable with data or "
-            "an offset); scatter = per-episode noise (a perception-precision problem). r2_vs_mean is the "
-            "fraction of ACROSS-EPISODE variation in the required displacement that the model captures: "
-            "0 means it predicts the average approach regardless of where the bolt is. Works in both "
-            "action modes (goes through _displacement_from_anchor), unlike grasp_instant_error_mm.",
+        "grasp_localization_note": "Signed per-axis error of the displacement predicted from L steps BEFORE the grasp to the "
+        "grasp frame, in mm, frame = ee_local at t (NOT world; the delta dataset stores no absolute "
+        "pose). bias = systematic offset (a depth/contact-distribution problem, fixable with data or "
+        "an offset); scatter = per-episode noise (a perception-precision problem). r2_vs_mean is the "
+        "fraction of ACROSS-EPISODE variation in the required displacement that the model captures: "
+        "0 means it predicts the average approach regardless of where the bolt is. Works in both "
+        "action modes (goes through _displacement_from_anchor), unlike grasp_instant_error_mm.",
         "grasp_instant_error_mm": {
             arm: {
                 ax: {

@@ -80,7 +80,5 @@ def resize_no_pad(images: np.ndarray, height: int, width: int, method=Image.BILI
 
     original_shape = images.shape
     images = images.reshape(-1, *original_shape[-3:])
-    resized = np.stack(
-        [np.asarray(Image.fromarray(im).resize((width, height), resample=method)) for im in images]
-    )
+    resized = np.stack([np.asarray(Image.fromarray(im).resize((width, height), resample=method)) for im in images])
     return resized.reshape(*original_shape[:-3], *resized.shape[-3:])

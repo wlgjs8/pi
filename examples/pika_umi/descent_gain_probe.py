@@ -19,6 +19,7 @@ Reported per arm:
 Ratios are computed on BINNED SUMS (sum of policy steps / sum of demo steps in the bin), not as a
 mean of per-frame ratios, which would be dominated by near-zero demo steps.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -74,12 +75,12 @@ def main() -> None:
     args = ap.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
     from openpi.policies import policy_config as _policy_config
     from openpi.training import config as _config
 
     cfg = _config.get_config(args.config)
-    policy = _policy_config.create_trained_policy(
-        cfg, str(pathlib.Path(args.ckpt_base) / str(args.checkpoint_step)))
+    policy = _policy_config.create_trained_policy(cfg, str(pathlib.Path(args.ckpt_base) / str(args.checkpoint_step)))
 
     phase_mod = _load_phase_segmentation()
     root = pathlib.Path(args.lerobot_home) / args.val_repo_id
@@ -121,16 +122,18 @@ def main() -> None:
                     "prompt": tasks_all[a0 + t],
                 }
                 pred = np.asarray(policy.infer(obs)["actions"], dtype=np.float64)[:, base : base + 6]
-                remain = _integrate(d[t:bf], bf - t)            # demo's remaining displacement
-                recs[arm].append({
-                    "L": int(bf - t),
-                    "remain_mm": (remain * 1000.0).tolist(),
-                    "remain_norm_mm": float(np.linalg.norm(remain) * 1000.0),
-                    "gt_row0_mm": (d[t, :3] * 1000.0).tolist(),
-                    "pr_row0_mm": (pred[0, :3] * 1000.0).tolist(),
-                    "gt_exec_mm": (_integrate(d[t:t + args.execute], args.execute) * 1000.0).tolist(),
-                    "pr_exec_mm": (_integrate(pred[:args.execute], args.execute) * 1000.0).tolist(),
-                })
+                remain = _integrate(d[t:bf], bf - t)  # demo's remaining displacement
+                recs[arm].append(
+                    {
+                        "L": int(bf - t),
+                        "remain_mm": (remain * 1000.0).tolist(),
+                        "remain_norm_mm": float(np.linalg.norm(remain) * 1000.0),
+                        "gt_row0_mm": (d[t, :3] * 1000.0).tolist(),
+                        "pr_row0_mm": (pred[0, :3] * 1000.0).tolist(),
+                        "gt_exec_mm": (_integrate(d[t : t + args.execute], args.execute) * 1000.0).tolist(),
+                        "pr_exec_mm": (_integrate(pred[: args.execute], args.execute) * 1000.0).tolist(),
+                    }
+                )
         print(f"[{ei + 1}/{n_ep}] episode_{ei:06d} ({sum(len(v) for v in recs.values())} rows)", flush=True)
 
     out = {"config": args.config, "step": args.checkpoint_step, "execute": args.execute, "arms": {}}
@@ -147,29 +150,33 @@ def main() -> None:
         ge = np.array([r["gt_exec_mm"][2] for r in R])
         pe = np.array([r["pr_exec_mm"][2] for r in R])
         bins = []
-        for lo, hi in zip(EDGES[:-1], EDGES[1:]):
+        for lo, hi in zip(EDGES[:-1], EDGES[1:], strict=True):
             m = (rn >= lo) & (rn < hi)
             if m.sum() < 10:
                 continue
-            bins.append({
-                "remain_mm": f"{lo}-{hi if hi < 1e8 else 'inf'}",
-                "n": int(m.sum()),
-                # summed, not averaged per-frame: near the target the demo step approaches zero and a
-                # mean of ratios would be dominated by division by ~0.
-                "gain_row0": float(p0[m].sum() / g0[m].sum()) if abs(g0[m].sum()) > 1e-9 else None,
-                "gain_exec": float(pe[m].sum() / ge[m].sum()) if abs(ge[m].sum()) > 1e-9 else None,
-                "gt_row0_mm_mean": float(g0[m].mean()),
-                "pr_row0_mm_mean": float(p0[m].mean()),
-                "resid_row0_mm_mean": float((g0[m] - p0[m]).mean()),
-                "resid_exec_mm_mean": float((ge[m] - pe[m]).mean()),
-            })
+            bins.append(
+                {
+                    "remain_mm": f"{lo}-{hi if hi < 1e8 else 'inf'}",
+                    "n": int(m.sum()),
+                    # summed, not averaged per-frame: near the target the demo step approaches zero and a
+                    # mean of ratios would be dominated by division by ~0.
+                    "gain_row0": float(p0[m].sum() / g0[m].sum()) if abs(g0[m].sum()) > 1e-9 else None,
+                    "gain_exec": float(pe[m].sum() / ge[m].sum()) if abs(ge[m].sum()) > 1e-9 else None,
+                    "gt_row0_mm_mean": float(g0[m].mean()),
+                    "pr_row0_mm_mean": float(p0[m].mean()),
+                    "resid_row0_mm_mean": float((g0[m] - p0[m]).mean()),
+                    "resid_exec_mm_mean": float((ge[m] - pe[m]).mean()),
+                }
+            )
         out["arms"][arm] = {"n": len(R), "bins": bins}
         print(f"\n=== {arm} (n={len(R)}) ===", flush=True)
         for b in bins:
-            print(f"  remain {b['remain_mm']:>8} mm  n={b['n']:5d}  gain_row0={b['gain_row0']:.3f}  "
-                  f"gain_exec={b['gain_exec']:.3f}  demo step {b['gt_row0_mm_mean']:+6.3f} vs "
-                  f"policy {b['pr_row0_mm_mean']:+6.3f} mm  (deficit {b['resid_row0_mm_mean']:+6.3f})",
-                  flush=True)
+            print(
+                f"  remain {b['remain_mm']:>8} mm  n={b['n']:5d}  gain_row0={b['gain_row0']:.3f}  "
+                f"gain_exec={b['gain_exec']:.3f}  demo step {b['gt_row0_mm_mean']:+6.3f} vs "
+                f"policy {b['pr_row0_mm_mean']:+6.3f} mm  (deficit {b['resid_row0_mm_mean']:+6.3f})",
+                flush=True,
+            )
     pathlib.Path(args.out).write_text(json.dumps(out, indent=2))
     print(f"\nwrote {args.out}")
 

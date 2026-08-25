@@ -75,8 +75,9 @@ def _color_prompt(arm: str, color: str, box_colors: dict) -> str:
     return f"ACTIVE_ARM={arm}. TARGET_BOLT={word}. DESTINATION_BOX={box}."
 
 
-def _pregrasp_color_labels(grip: np.ndarray, color_val: int, n: int, binary_th: float,
-                           lo: int = 15, hi: int = 5) -> np.ndarray:
+def _pregrasp_color_labels(
+    grip: np.ndarray, color_val: int, n: int, binary_th: float, lo: int = 15, hi: int = 5
+) -> np.ndarray:
     """Per-frame AUX color label for one arm, valid ONLY in the pre-grasp window before each grasp
     (gripper open->closed transition): frames [close-lo, close-hi) get `color_val`, else -1. This is
     when the active wrist looks at the target bolt (not yet occluded by the closed gripper / not place /
@@ -152,7 +153,9 @@ def _depth_to_image(
     return np.repeat(g[..., None], 3, axis=2)
 
 
-def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "pose", action_mode: str = "delta") -> dict:
+def _make_hold_frame(
+    last_frame: dict, gripper_action: str, state_mode: str = "pose", action_mode: str = "delta"
+) -> dict:
     """A frozen 'hold' frame: last image + state held, action = stay-put. Appended to an episode's FINAL
     segment to extend the short post-release tail (see the tail-pad rationale at the write loop).
     Action: delta mode -> zero pose delta (+ held absolute gripper); anchored mode -> repeat the last
@@ -181,7 +184,9 @@ def _make_hold_frame(last_frame: dict, gripper_action: str, state_mode: str = "p
         hold_state[[0, 1, 2, 10, 11, 12]] = 0.0  # zero pos-vel; HOLD absolute orientation(3-8,13-18)+grip(9,19)
     elif state_mode == "velocity_grav":
         hold_state = st.copy()
-        hold_state[[0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]] = 0.0  # zero pos+rot vel; HOLD gravity(6-8,16-18)+grip(9,19)
+        hold_state[[0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15]] = (
+            0.0  # zero pos+rot vel; HOLD gravity(6-8,16-18)+grip(9,19)
+        )
     elif state_mode == "velocity_rotrel":
         hold_state = st.copy()
         hold_state[[0, 1, 2, 7, 8, 9]] = 0.0  # zero pos-vel; HOLD rot_rel(3-5,10-12)+grip(6,13)
@@ -420,10 +425,14 @@ def _arm_actions_anchored(pose, grip, gripper_action: str, binary_th: float = 25
     return np.concatenate([p, rotvec, grip_col], axis=1).astype(np.float32)
 
 
-def _actions_anchored(left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0) -> np.ndarray:
+def _actions_anchored(
+    left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0
+) -> np.ndarray:
     return np.concatenate(
-        [_arm_actions_anchored(left_pose, left_grip, gripper_action, binary_th),
-         _arm_actions_anchored(right_pose, right_grip, gripper_action, binary_th)],
+        [
+            _arm_actions_anchored(left_pose, left_grip, gripper_action, binary_th),
+            _arm_actions_anchored(right_pose, right_grip, gripper_action, binary_th),
+        ],
         axis=1,
     ).astype(np.float32)
 
@@ -466,11 +475,14 @@ def _arm_actions(pose, grip, gripper_action: str, binary_th: float = 25.0, step_
     return np.concatenate([pos_delta_local, rot_delta, grip_col], axis=1).astype(np.float32)
 
 
-def _actions(left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0,
-             step_frames: int = 1) -> np.ndarray:
+def _actions(
+    left_pose, right_pose, left_grip, right_grip, gripper_action: str, binary_th: float = 25.0, step_frames: int = 1
+) -> np.ndarray:
     return np.concatenate(
-        [_arm_actions(left_pose, left_grip, gripper_action, binary_th, step_frames),
-         _arm_actions(right_pose, right_grip, gripper_action, binary_th, step_frames)],
+        [
+            _arm_actions(left_pose, left_grip, gripper_action, binary_th, step_frames),
+            _arm_actions(right_pose, right_grip, gripper_action, binary_th, step_frames),
+        ],
         axis=1,
     ).astype(np.float32)
 
@@ -833,7 +845,9 @@ def main(
     if include_depth and not (0.0 <= depth_z_near_mm < depth_z_far_mm):
         raise ValueError(f"need 0 <= depth_z_near_mm < depth_z_far_mm, got {depth_z_near_mm}/{depth_z_far_mm}")
     if state_mode not in ("pose", "velocity", "velocity_grip", "velocity_absrot6d", "velocity_grav", "velocity_rotrel"):
-        raise ValueError(f"--state-mode must be one of pose|velocity|velocity_grip|velocity_absrot6d|velocity_grav|velocity_rotrel, got {state_mode!r}")
+        raise ValueError(
+            f"--state-mode must be one of pose|velocity|velocity_grip|velocity_absrot6d|velocity_grav|velocity_rotrel, got {state_mode!r}"
+        )
     if action_mode not in ("delta", "anchored"):
         raise ValueError(f"--action-mode must be 'delta' or 'anchored', got {action_mode!r}")
     if action_mode == "anchored" and gripper_action == "delta":
@@ -852,11 +866,15 @@ def main(
                 f"(got {state_mode!r}); other modes do not share the K-frame velocity window"
             )
         if action_mode != "delta":
-            raise ValueError("--action-step-frames > 1 requires --action-mode delta (anchored rows are "
-                             "absolute poses; use the train config's action_step_frames stride instead)")
+            raise ValueError(
+                "--action-step-frames > 1 requires --action-mode delta (anchored rows are "
+                "absolute poses; use the train config's action_step_frames stride instead)"
+            )
         if min_seg_frames <= int(action_step_frames):
-            raise ValueError(f"--min-seg-frames ({min_seg_frames}) must exceed --action-step-frames "
-                             f"({action_step_frames}); a segment shorter than K yields no action row")
+            raise ValueError(
+                f"--min-seg-frames ({min_seg_frames}) must exceed --action-step-frames "
+                f"({action_step_frames}); a segment shorter than K yields no action row"
+            )
     if prompt_mode not in ("single", "phase_color"):
         raise ValueError(f"--prompt-mode must be 'single' or 'phase_color', got {prompt_mode!r}")
     # phase_color: bolt-color -> coordinated box-color map (parse '--box-colors black=green,gray=gray').
@@ -895,7 +913,9 @@ def main(
         print(f"pose frame: tcp_tip (tool offset inv(T_tcp_umi_gripper) applied) <- {retarget_config}")
     else:
         print("pose frame: raw tracker (steamvr_world, NO tool offset) -- legacy *_8020 behavior")
-    print(f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames")
+    print(
+        f"gap-aware split: dt>{gap_threshold_s*1000:.0f}ms breaks an episode; drop segments < {min_seg_frames} frames"
+    )
     print(
         f"camera={camera} | gripper_action={gripper_action} | state_mode={state_mode} (state_dim={state_dim}) | "
         f"action_mode={action_mode} | arm={arm} (state_dim={state_dim}, action_dim={action_dim}) | "
@@ -904,7 +924,11 @@ def main(
     )
     print(
         f"depth: {'ON' if include_depth else 'off'}"
-        + (f" (realsense_depth -> *_wrist_0_depth, clip [{depth_z_near_mm:.0f},{depth_z_far_mm:.0f}]mm)" if include_depth else "")
+        + (
+            f" (realsense_depth -> *_wrist_0_depth, clip [{depth_z_near_mm:.0f},{depth_z_far_mm:.0f}]mm)"
+            if include_depth
+            else ""
+        )
     )
 
     episodes = _find_episodes(data_root)
@@ -915,7 +939,9 @@ def main(
     if exclude_path_substr:
         n0 = len(episodes)
         episodes = [e for e in episodes if exclude_path_substr not in str(e)]
-        print(f"excluded {n0 - len(episodes)} episodes matching path substr {exclude_path_substr!r} -> {len(episodes)} remain")
+        print(
+            f"excluded {n0 - len(episodes)} episodes matching path substr {exclude_path_substr!r} -> {len(episodes)} remain"
+        )
     # Drop episodes already used in a prior split (build a fresh/unseen test set from new collection).
     if exclude_record is not None:
         ex = json.loads(pathlib.Path(exclude_record).read_text())
@@ -938,7 +964,9 @@ def main(
             raise SystemExit(f"--val-from-record: {len(miss)} pinned val episodes not found: {sorted(miss)[:5]}")
         val_idx = {i for i, e in enumerate(episodes) if _key(e) in val_keys}
         n_val = len(val_idx)
-        print(f"val-from-record {val_from_record}: {n_val} val pinned, {len(episodes) - n_val} -> train (new episodes included)")
+        print(
+            f"val-from-record {val_from_record}: {n_val} val pinned, {len(episodes) - n_val} -> train (new episodes included)"
+        )
     elif split_in is not None:
         # Reproduce an EXACT prior split (e.g. the tcp_8020 realsense run) so a fisheye dataset
         # differs only in pixels -> apples-to-apples camera comparison AND reusable norm-stats
@@ -961,12 +989,19 @@ def main(
         order = rng.permutation(len(episodes))
         n_val = max(1, round(val_frac * len(episodes))) if val_frac > 0 else 0
         val_idx = set(order[:n_val].tolist())
-        print(f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val (camera={camera})")
+        print(
+            f"found {len(episodes)} episodes; split seed={seed} -> {len(episodes) - n_val} train / {n_val} val (camera={camera})"
+        )
 
-    train_ds = _make_dataset(train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth, state_dim, action_dim, emit_color_labels)
+    train_ds = _make_dataset(
+        train_repo_id, lerobot_home / train_repo_id, img_shape, include_depth, state_dim, action_dim, emit_color_labels
+    )
     val_ds = (
-        _make_dataset(val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth, state_dim, action_dim, emit_color_labels)
-        if n_val > 0 else None
+        _make_dataset(
+            val_repo_id, lerobot_home / val_repo_id, img_shape, include_depth, state_dim, action_dim, emit_color_labels
+        )
+        if n_val > 0
+        else None
     )
 
     counts = {"train": [0, 0], "val": [0, 0]}  # [segments(=lerobot episodes), frames]
@@ -986,9 +1021,25 @@ def main(
         for attempt in range(4):
             try:
                 segments, n_writable = _episode_frames(
-                    ep, tool_offset, gap_threshold_s, min_seg_frames, camera, crop_frac, gripper_action,
-                    gripper_binary_th, include_depth, depth_z_near_mm, depth_z_far_mm, depth_units_m, state_mode,
-                    action_mode, arm, prompt, prompt_mode, _box_colors_map, emit_color_labels,
+                    ep,
+                    tool_offset,
+                    gap_threshold_s,
+                    min_seg_frames,
+                    camera,
+                    crop_frac,
+                    gripper_action,
+                    gripper_binary_th,
+                    include_depth,
+                    depth_z_near_mm,
+                    depth_z_far_mm,
+                    depth_units_m,
+                    state_mode,
+                    action_mode,
+                    arm,
+                    prompt,
+                    prompt_mode,
+                    _box_colors_map,
+                    emit_color_labels,
                     action_step_frames,
                 )
                 break

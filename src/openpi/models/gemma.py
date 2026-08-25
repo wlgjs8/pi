@@ -52,8 +52,17 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora",
-                 "gemma_2b_d9", "gemma_2b_d6", "gemma_300m_d9", "gemma_300m_d6"]
+Variant = Literal[
+    "dummy",
+    "gemma_300m",
+    "gemma_300m_lora",
+    "gemma_2b",
+    "gemma_2b_lora",
+    "gemma_2b_d9",
+    "gemma_2b_d6",
+    "gemma_300m_d9",
+    "gemma_300m_d6",
+]
 
 
 def get_config(variant: Variant) -> Config:

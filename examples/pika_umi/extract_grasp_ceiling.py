@@ -21,6 +21,7 @@ evaluation can be restricted to L=12 / L=23 and compared to the VLA cell-for-cel
 Images are written at NATIVE 480x640 as JPEG. The 224 runs downsample at load time; the native-
 resolution run reads them as-is. One extraction serves both.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -74,8 +75,9 @@ def main() -> None:
     ap.add_argument("--lerobot-home", required=True)
     ap.add_argument("--split", required=True, choices=["train", "val"])
     ap.add_argument("--out", default="/home/plaif/grasp_ceiling")
-    ap.add_argument("--lookback", type=int, default=40,
-                    help="sample t in [b-lookback, b-1]; L23 (the primary eval point) must fit")
+    ap.add_argument(
+        "--lookback", type=int, default=40, help="sample t in [b-lookback, b-1]; L23 (the primary eval point) must fit"
+    )
     ap.add_argument("--jpeg-quality", type=int, default=95)
     ap.add_argument("--limit", type=int, default=None)
     args = ap.parse_args()
@@ -100,14 +102,15 @@ def main() -> None:
     n_clean = 0
     for ei in range(n_ep):
         a, b_ = int(ep_from[ei]), int(ep_to[ei])
-        gt = actions_all[a : b_ - 1]           # (T-1, 14) per-step ee_local deltas
+        gt = actions_all[a : b_ - 1]  # (T-1, 14) per-step ee_local deltas
         states = states_all[a : b_ - 1]
         length = gt.shape[0]
         if states.shape[1] > 13:
             left_grip = states[:, 6] * 100.0
             right_grip = states[:, 13] * 100.0
-        else:                                   # velocity-only proprio carries no gripper
-            left_grip = np.zeros(len(states)); right_grip = np.zeros(len(states))
+        else:  # velocity-only proprio carries no gripper
+            left_grip = np.zeros(len(states))
+            right_grip = np.zeros(len(states))
         bounds = phase_mod.extract_phase_boundaries(left_grip, right_grip, length)
         if not bounds.clean:
             print(f"[{ei + 1}/{n_ep}] episode_{ei:06d} SKIP (phase bounds not clean)", flush=True)
@@ -134,8 +137,7 @@ def main() -> None:
                 pos, rot = _displacement_to(d[t:bf], bf - t)
                 name = f"{ei:06d}_{arm}_{t:04d}.jpg"
                 Image.fromarray(fr[t]).save(img_dir / name, quality=args.jpeg_quality)
-                rows.append((name, ei, 0 if arm == "left" else 1, t, bf, bf - t,
-                             *pos, *rot, *states[t]))
+                rows.append((name, ei, 0 if arm == "left" else 1, t, bf, bf - t, *pos, *rot, *states[t]))
         print(f"[{ei + 1}/{n_ep}] episode_{ei:06d} done (rows {len(rows)})", flush=True)
 
     if not rows:
@@ -146,19 +148,27 @@ def main() -> None:
         out / f"meta_{args.split}.npz",
         name=names,
         ep=num[:, 0].astype(np.int32),
-        arm=num[:, 1].astype(np.int8),      # 0 = left, 1 = right
+        arm=num[:, 1].astype(np.int8),  # 0 = left, 1 = right
         t=num[:, 2].astype(np.int32),
         b=num[:, 3].astype(np.int32),
-        L=num[:, 4].astype(np.int32),       # steps-to-grasp; metadata only, never an input
-        target_pos=num[:, 5:8],             # metres, ee_local at t
-        target_rot=num[:, 8:11],            # rotvec, ee_local at t
+        L=num[:, 4].astype(np.int32),  # steps-to-grasp; metadata only, never an input
+        target_pos=num[:, 5:8],  # metres, ee_local at t
+        target_rot=num[:, 8:11],  # rotvec, ee_local at t
         state=num[:, 11:],
     )
-    print(json.dumps({
-        "split": args.split, "episodes_seen": n_ep, "episodes_clean": n_clean,
-        "rows": len(rows), "images": str(img_dir),
-        "target_pos_std_mm": (num[:, 5:8].std(axis=0) * 1000).round(2).tolist(),
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "split": args.split,
+                "episodes_seen": n_ep,
+                "episodes_clean": n_clean,
+                "rows": len(rows),
+                "images": str(img_dir),
+                "target_pos_std_mm": (num[:, 5:8].std(axis=0) * 1000).round(2).tolist(),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

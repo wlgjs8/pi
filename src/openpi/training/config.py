@@ -562,7 +562,18 @@ class LeRobotPikaUmiDataConfig(DataConfigFactory):
             # episode-boundary padding. Absent at serve time, hence optional.
             inputs=[_transforms.RepackTransform(repack_map, optional=("actions_is_pad",))]
         )
-        data_input_transforms = [pika_umi_policy.PikaUmiInputs(model_type=model_config.model_type, include_depth=self.include_depth, zero_state=self.zero_state, action_mode=self.action_mode, aux_color_labels=self.aux_color_labels, drop_base_image=self.drop_base_image, drop_velocity_proprio=self.drop_velocity_proprio, drop_task_prompt=self.drop_task_prompt)]
+        data_input_transforms = [
+            pika_umi_policy.PikaUmiInputs(
+                model_type=model_config.model_type,
+                include_depth=self.include_depth,
+                zero_state=self.zero_state,
+                action_mode=self.action_mode,
+                aux_color_labels=self.aux_color_labels,
+                drop_base_image=self.drop_base_image,
+                drop_velocity_proprio=self.drop_velocity_proprio,
+                drop_task_prompt=self.drop_task_prompt,
+            )
+        ]
         if self.center_crop is not None:
             data_input_transforms.append(_transforms.CenterCropImages(self.center_crop, self.center_crop))
         data_transforms = _transforms.Group(
@@ -1340,7 +1351,9 @@ _CONFIGS = [
         ),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_gripabs_8020",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_h24"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_gripabs_h24"
+            ),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -1367,7 +1380,9 @@ _CONFIGS = [
         ),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_8020_rs_absgrip",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_rs_absgrip"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_rs_absgrip"
+            ),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -1393,7 +1408,9 @@ _CONFIGS = [
         ),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_8020_fe65_absgrip",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip"
+            ),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -1421,7 +1438,9 @@ _CONFIGS = [
         ),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_8020_fe65_absgrip_tp30",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip_tp30"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_8020_h24_fe65_absgrip_tp30"
+            ),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -1447,7 +1466,9 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50"
+            ),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -1475,7 +1496,9 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_binary_h50_depth",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_depth"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_depth"
+            ),
             base_config=DataConfig(prompt_from_task=True),
             include_depth=True,
         ),
@@ -1500,7 +1523,9 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=24),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h24_nostate"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h24_nostate"
+            ),
             zero_state=True,
             base_config=DataConfig(prompt_from_task=True),
         ),
@@ -1523,7 +1548,9 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50"
+            ),
             zero_state=True,
             base_config=DataConfig(prompt_from_task=True),
         ),
@@ -1548,7 +1575,9 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_binary_h50",
-            assets=AssetsConfig(assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_dart"),
+            assets=AssetsConfig(
+                assets_dir="/home/plaif/workspace/openpi_runs/assets/pi05_pika_umi_video_tcp_binary_h50_dart"
+            ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 dart_noise=_transforms.DartNoiseConfig(sigma_pos_m=0.01, recover_steps=5, prob=0.5),
@@ -1788,7 +1817,13 @@ _CONFIGS = [
             pi05=True,
             action_dim=32,
             action_horizon=24,
-            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+            image_keys=(
+                "base_0_rgb",
+                "left_wrist_0_rgb",
+                "right_wrist_0_rgb",
+                "left_wrist_0_depth",
+                "right_wrist_0_depth",
+            ),
         ),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50",
@@ -1972,7 +2007,9 @@ _CONFIGS = [
         # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
         # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
         # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2023,7 +2060,9 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=80_000,
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2076,7 +2115,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2130,7 +2171,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2181,7 +2224,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2230,7 +2275,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2277,7 +2324,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2337,7 +2386,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2387,7 +2438,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2432,7 +2485,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2473,7 +2528,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2514,7 +2571,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2567,7 +2626,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=40_000,
         # decay_steps tracks num_train_steps so the shortened screen is not also an LR-schedule change.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=40_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2611,7 +2672,9 @@ _CONFIGS = [
         # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
         # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
         # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2652,7 +2715,9 @@ _CONFIGS = [
         # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
         # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
         # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2688,7 +2753,9 @@ _CONFIGS = [
         # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
         # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
         # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2725,7 +2792,9 @@ _CONFIGS = [
         # The inherited default decays over 30k while we train 80k, so 5/8 of the run sits at the
         # 2.5e-6 floor. Measured consequence on v1: E1 60k->80k moved train loss 0.0106->0.0093 but
         # val chunk nMSE 0.6453->0.6462 (nothing). Decay across the full run instead.
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=2.5e-5, decay_steps=80_000, decay_lr=2.5e-6
+        ),
         batch_size=64,
         save_interval=5000,
         keep_period=10000,
@@ -2781,7 +2850,13 @@ _CONFIGS = [
             pi05=True,
             action_dim=32,
             action_horizon=24,
-            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+            image_keys=(
+                "base_0_rgb",
+                "left_wrist_0_rgb",
+                "right_wrist_0_rgb",
+                "left_wrist_0_depth",
+                "right_wrist_0_depth",
+            ),
         ),
         data=LeRobotPikaUmiDataConfig(
             repo_id="plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth_z50_colorprompt",
@@ -2818,7 +2893,13 @@ _CONFIGS = [
             pi05=True,
             action_dim=32,
             action_horizon=24,
-            image_keys=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb", "left_wrist_0_depth", "right_wrist_0_depth"),
+            image_keys=(
+                "base_0_rgb",
+                "left_wrist_0_rgb",
+                "right_wrist_0_rgb",
+                "left_wrist_0_depth",
+                "right_wrist_0_depth",
+            ),
             aux_color_weight=0.5,
             photometric_aug=False,  # OFF: jitter randomizes the black-vs-silver brightness cue this task needs
         ),

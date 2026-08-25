@@ -27,6 +27,7 @@ guidance DURING flow sampling and have no faithful post-hoc equivalent for an x0
 they are rejected instead of silently approximated by a blend. That is also the posture the hardware
 runs: exp was measured to make the descent 7-14 mm shallower and the chunk boundary rougher.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -53,10 +54,21 @@ def _unnormalize(x, q01, q99):
 class VAWebsocketPolicy:
     """openpi_client.base_policy.BasePolicy surface: infer(obs) -> dict."""
 
-    def __init__(self, models, res, horizon, branch, flow_steps, noise_scale, norm_stats, device,
-                 pm1: bool = False, pin_state_grip=None):
+    def __init__(
+        self,
+        models,
+        res,
+        horizon,
+        branch,
+        flow_steps,
+        noise_scale,
+        norm_stats,
+        device,
+        pm1: bool = False,
+        pin_state_grip=None,
+    ):
         self.models = models
-        self.pm1 = pm1                 # SigLIP backbone: [-1,1] input (openpi convention), not ImageNet
+        self.pm1 = pm1  # SigLIP backbone: [-1,1] input (openpi convention), not ImageNet
         self.pin_state_grip = pin_state_grip
         self.res = res
         self.horizon = horizon
@@ -79,7 +91,7 @@ class VAWebsocketPolicy:
 
         x = image_tools.resize_with_pad(np.asarray(img), self.res, self.res)
         x = torch.from_numpy(np.asarray(x).copy()).permute(2, 0, 1).float() / 255.0
-        if self.pm1 == "raw01":                # sigdino: branches normalise inside encode()
+        if self.pm1 == "raw01":  # sigdino: branches normalise inside encode()
             return x[None].to(self.device).to(torch.bfloat16)
         if self.pm1 in (True, "pm1"):
             return (x * 2.0 - 1.0)[None].to(self.device).to(torch.bfloat16)
@@ -96,8 +108,7 @@ class VAWebsocketPolicy:
         state = np.asarray(obs["observation/state"], dtype=np.float64)[:REAL_DIM]
         if state.shape[0] != REAL_DIM:
             raise ValueError(
-                f"observation/state has {state.shape[0]} dims, VA expects {REAL_DIM} "
-                "(--proprio-mode velocity_grip)"
+                f"observation/state has {state.shape[0]} dims, VA expects {REAL_DIM} " "(--proprio-mode velocity_grip)"
             )
         if self.pin_state_grip is not None:
             state = state.copy()
@@ -108,11 +119,16 @@ class VAWebsocketPolicy:
         # Ensemble members average in NORMALISED space, matching eval_va_grasp.py's --ckpt2 path.
         chunks = [
             m.sample_actions(
-                img_l, img_r, st,
+                img_l,
+                img_r,
+                st,
                 num_steps=self.flow_steps,
                 noise_scale=self.noise_scale,
                 branch=self.branch,
-            ).float().cpu().numpy()[0]
+            )
+            .float()
+            .cpu()
+            .numpy()[0]
             for m in self.models
         ]
         norm_chunk = np.mean(chunks, axis=0) if len(chunks) > 1 else chunks[0]
@@ -148,44 +164,67 @@ class VAWebsocketPolicy:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", action="append", required=True,
-                    help="VA checkpoint (.pt). Repeat to average an ensemble; all members must "
-                         "share head/horizon.")
+    ap.add_argument(
+        "--ckpt",
+        action="append",
+        required=True,
+        help="VA checkpoint (.pt). Repeat to average an ensemble; all members must " "share head/horizon.",
+    )
     ap.add_argument("--weights-dir", default="/home/plaif/dinov3_weights")
     ap.add_argument("--dinov3-src", default="/home/plaif/dinov3_src")
-    ap.add_argument("--va-src", default="/home/plaif/workspace/openpi/examples/pika_umi",
-                    help="directory containing train_va_dinov3.py (VAPolicy definition)")
+    ap.add_argument(
+        "--va-src",
+        default="/home/plaif/workspace/openpi/examples/pika_umi",
+        help="directory containing train_va_dinov3.py (VAPolicy definition)",
+    )
     ap.add_argument("--port", type=int, default=8003)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--compile", action="store_true",
-                    help="torch.compile the c2 expert paths (reduce-overhead/CUDA graphs). The "
-                         "18-layer expert is kernel-launch-bound in eager mode: measured 101.5 -> "
-                         "36.0 ms/infer on gpu6. First few infers after start are slow (compile "
-                         "warmup) -- the server warms itself before accepting the first client.")
-    ap.add_argument("--pin-state-grip", type=float, nargs=2, default=None, metavar=("L", "R"),
-                    help="Override the observation's state grip dims (6/13) with constants (raw "
-                         "fraction units, e.g. 0.83 0.66 = demo approach medians). Diagnostic for "
-                         "the measured on-robot grip echo spiral (cmd~=meas-5%%/tick): with the echo "
-                         "input pinned, any close that still fires must come from VISION. If the "
-                         "gripper then closes at the bolt, the visual close gate transfers to the "
-                         "robot and this is a viable scaffold; if it never closes, grip vision is "
-                         "domain-blind and the training-side fix (grip-state randomisation) is "
-                         "required.")
-    ap.add_argument("--branch", default="l2", choices=["l2", "flow"],
-                    help="dual-head branch to serve. l2 = deterministic, the val champion at L=5. "
-                         "flow = multimodal, needed only for multi-draw sampling.")
+    ap.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the c2 expert paths (reduce-overhead/CUDA graphs). The "
+        "18-layer expert is kernel-launch-bound in eager mode: measured 101.5 -> "
+        "36.0 ms/infer on gpu6. First few infers after start are slow (compile "
+        "warmup) -- the server warms itself before accepting the first client.",
+    )
+    ap.add_argument(
+        "--pin-state-grip",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("L", "R"),
+        help="Override the observation's state grip dims (6/13) with constants (raw "
+        "fraction units, e.g. 0.83 0.66 = demo approach medians). Diagnostic for "
+        "the measured on-robot grip echo spiral (cmd~=meas-5%%/tick): with the echo "
+        "input pinned, any close that still fires must come from VISION. If the "
+        "gripper then closes at the bolt, the visual close gate transfers to the "
+        "robot and this is a viable scaffold; if it never closes, grip vision is "
+        "domain-blind and the training-side fix (grip-state randomisation) is "
+        "required.",
+    )
+    ap.add_argument(
+        "--branch",
+        default="l2",
+        choices=["l2", "flow"],
+        help="dual-head branch to serve. l2 = deterministic, the val champion at L=5. "
+        "flow = multimodal, needed only for multi-draw sampling.",
+    )
     ap.add_argument("--flow-steps", type=int, default=10)
     ap.add_argument("--noise-scale", type=float, default=1.0)
-    ap.add_argument("--config", default=None,
-                    help="openpi config for norm stats. Default: the config recorded in the "
-                         "checkpoint, which is what it trained through.")
+    ap.add_argument(
+        "--config",
+        default=None,
+        help="openpi config for norm stats. Default: the config recorded in the "
+        "checkpoint, which is what it trained through.",
+    )
     args = ap.parse_args()
 
     sys.path.insert(0, args.dinov3_src)
     sys.path.insert(0, args.va_src)
     from train_va_dinov3 import VAPolicy
-    import openpi.training.config as _config
+
     from openpi.serving import websocket_policy_server
+    import openpi.training.config as _config
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -205,18 +244,28 @@ def main() -> None:
         if ck.get("arch") == "c2":
             # C2: transplanted pi05_base 300M expert head (c2_policy). Consumes [-1,1] images.
             from c2_policy import C2Policy
+
             m = C2Policy(ck["size"], pathlib.Path(args.weights_dir), ck["horizon"])
         else:
-            m = VAPolicy(ck["size"], pathlib.Path(args.weights_dir), ck["horizon"],
-                         backbone_type=ck.get("backbone", "dinov3"), wm_head=ck.get("wm", False),
-                         state_tokens=ck.get("state_tokens", 0),
-                         head_mode=ck.get("head", "l2"), layers=ck.get("layers", 4),
-                         split_head=ck.get("split_head", False))
+            m = VAPolicy(
+                ck["size"],
+                pathlib.Path(args.weights_dir),
+                ck["horizon"],
+                backbone_type=ck.get("backbone", "dinov3"),
+                wm_head=ck.get("wm", False),
+                state_tokens=ck.get("state_tokens", 0),
+                head_mode=ck.get("head", "l2"),
+                layers=ck.get("layers", 4),
+                split_head=ck.get("split_head", False),
+            )
         sd = ck.get("ema") or ck["model"]
         m.load_state_dict({k: v.float() for k, v in sd.items()})
         models.append(m.to(device).eval().to(torch.bfloat16))
-        print(f"[serve_va] loaded {path}  head={ck.get('head')} H={ck['horizon']} "
-              f"step={ck.get('step')} ema={'yes' if ck.get('ema') else 'NO'}", flush=True)
+        print(
+            f"[serve_va] loaded {path}  head={ck.get('head')} H={ck['horizon']} "
+            f"step={ck.get('step')} ema={'yes' if ck.get('ema') else 'NO'}",
+            flush=True,
+        )
 
     if args.branch == "l2" and head == "flow":
         raise SystemExit("--branch l2 requires a dual- or l2-head checkpoint; this one is flow-only")
@@ -236,21 +285,44 @@ def main() -> None:
             for _ in range(4):
                 models[0].sample_actions(_z, _z, _s, num_steps=args.flow_steps)
         print("[serve_va] c2 compiled + warmed", flush=True)
-    pm1 = ("pm1" if ck.get("arch") == "c2"
-           else {"siglip": "pm1", "sigdino": "raw01"}.get(ck.get("backbone", "dinov3"), False))
-    policy = VAWebsocketPolicy(models, res, horizon, args.branch, args.flow_steps,
-                               args.noise_scale, norm_stats, device, pm1=pm1,
-                               pin_state_grip=args.pin_state_grip)
+    pm1 = (
+        "pm1"
+        if ck.get("arch") == "c2"
+        else {"siglip": "pm1", "sigdino": "raw01"}.get(ck.get("backbone", "dinov3"), False)
+    )
+    policy = VAWebsocketPolicy(
+        models,
+        res,
+        horizon,
+        args.branch,
+        args.flow_steps,
+        args.noise_scale,
+        norm_stats,
+        device,
+        pm1=pm1,
+        pin_state_grip=args.pin_state_grip,
+    )
     if args.pin_state_grip:
-        print(f"[serve_va] state grip PINNED to L={args.pin_state_grip[0]} "
-              f"R={args.pin_state_grip[1]} (echo-spiral diagnostic)", flush=True)
+        print(
+            f"[serve_va] state grip PINNED to L={args.pin_state_grip[0]} "
+            f"R={args.pin_state_grip[1]} (echo-spiral diagnostic)",
+            flush=True,
+        )
 
-    print(f"[serve_va] serving {len(models)} model(s) branch={args.branch} H={horizon} "
-          f"res={res} on {args.host}:{args.port}", flush=True)
-    print("[serve_va] client must use --proprio-mode velocity_grip, "
-          f"FLOW_INFER_ACTION_HORIZON={horizon}, FLOW_INFER_RTC_SCHEDULE=zeros", flush=True)
+    print(
+        f"[serve_va] serving {len(models)} model(s) branch={args.branch} H={horizon} "
+        f"res={res} on {args.host}:{args.port}",
+        flush=True,
+    )
+    print(
+        "[serve_va] client must use --proprio-mode velocity_grip, "
+        f"FLOW_INFER_ACTION_HORIZON={horizon}, FLOW_INFER_RTC_SCHEDULE=zeros",
+        flush=True,
+    )
     websocket_policy_server.WebsocketPolicyServer(
-        policy=policy, host=args.host, port=args.port,
+        policy=policy,
+        host=args.host,
+        port=args.port,
         metadata={"va_ckpt": args.ckpt, "branch": args.branch, "horizon": horizon},
     ).serve_forever()
 

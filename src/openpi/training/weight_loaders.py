@@ -98,10 +98,9 @@ def _interpolate_posemb(loaded_params: at.Params, params: at.Params) -> at.Param
         if v.shape == ref.shape:
             continue
         n_old, n_new = v.shape[-2], ref.shape[-2]
-        g_old, g_new = int(round(n_old ** 0.5)), int(round(n_new ** 0.5))
+        g_old, g_new = int(round(n_old**0.5)), int(round(n_new**0.5))
         if g_old * g_old != n_old or g_new * g_new != n_new or v.shape[-1] != ref.shape[-1]:
-            raise ValueError(
-                f"cannot interpolate {k}: {v.shape} -> {ref.shape} (non-square or width mismatch)")
+            raise ValueError(f"cannot interpolate {k}: {v.shape} -> {ref.shape} (non-square or width mismatch)")
         width = v.shape[-1]
         grid = np.asarray(v, dtype=np.float32).reshape(g_old, g_old, width)
         # jax.image.resize handles the (h, w, c) grid directly and matches the reference impls.

@@ -106,9 +106,7 @@ def clean_estimate(x_t: torch.Tensor, v_t: torch.Tensor, t: float) -> torch.Tens
     return x_t + (1.0 - float(t)) * v_t
 
 
-def freeze_prefix(
-    x_t: torch.Tensor, prev_action_chunk: torch.Tensor, inference_delay: int
-) -> torch.Tensor:
+def freeze_prefix(x_t: torch.Tensor, prev_action_chunk: torch.Tensor, inference_delay: int) -> torch.Tensor:
     """Overwrite the first ``inference_delay`` actions with the committed plan.
 
     These are guaranteed to execute during the inference delay, so they are hard
@@ -186,9 +184,7 @@ def rtc_sample(
     t = 0.0
     for _ in range(int(num_steps)):
         x_t = freeze_prefix(x_t, prev_action_chunk, inference_delay)
-        v_t = rtc_guided_velocity(
-            x_t, t, prev_action_chunk, weights, denoise_fn, max_guidance_weight
-        )
+        v_t = rtc_guided_velocity(x_t, t, prev_action_chunk, weights, denoise_fn, max_guidance_weight)
         x_t = x_t + dt * v_t
         t += dt
     return freeze_prefix(x_t, prev_action_chunk, inference_delay)

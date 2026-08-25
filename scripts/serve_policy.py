@@ -137,9 +137,7 @@ def create_policy(args: Args) -> _policy.Policy:
                 default_prompt=args.default_prompt,
             )
         case Default():
-            return create_default_policy(
-                args.env, default_prompt=args.default_prompt, compile_mode=args.compile_mode
-            )
+            return create_default_policy(args.env, default_prompt=args.default_prompt, compile_mode=args.compile_mode)
 
 
 def _resolve_config(args: Args):
@@ -195,16 +193,16 @@ def warmup_policy(policy: _policy.Policy, train_config, *, batch_size: int = 1) 
 
 
 def main(args: Args) -> None:
-    logging.info(
-        "Serving with compile_mode=%s, num_medoid_samples=%d", args.compile_mode, args.num_medoid_samples
-    )
+    logging.info("Serving with compile_mode=%s, num_medoid_samples=%d", args.compile_mode, args.num_medoid_samples)
     policy = create_policy(args)
     if args.warmup:
         warmup_batch_size = args.num_medoid_samples if not policy._is_pytorch_model else 1
         warmup_policy(policy, _resolve_config(args), batch_size=warmup_batch_size)
     if args.num_medoid_samples > 1:
-        logging.info("Wrapping policy in MedoidPolicy (num_samples=%d): consensus selection at inference",
-                     args.num_medoid_samples)
+        logging.info(
+            "Wrapping policy in MedoidPolicy (num_samples=%d): consensus selection at inference",
+            args.num_medoid_samples,
+        )
         policy = _policy.MedoidPolicy(policy, num_samples=args.num_medoid_samples)
     policy_metadata = policy.metadata
 

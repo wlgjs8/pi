@@ -136,6 +136,33 @@ unfixable = [
     "B905", # Fix defaults to strict=False, which is not what we want.
 ]
 
+# One-off research/analysis scripts under examples/pika_umi are held to a narrower
+# bar than library code: naming and call-style conventions are relaxed, while every
+# rule that catches an actual defect (B, F8, SIM115, ...) stays on.
+[tool.ruff.lint.per-file-ignores]
+"examples/pika_umi/*" = [
+    "N806",   # Matrix/horizon notation (R, H, K) is the readable form here.
+    "N812",   # Ditto for imported aliases (np.linalg as LA and friends).
+    "N814",
+    "FBT001", # argparse-driven scripts pass booleans positionally.
+    "FBT002",
+    "C408",   # dict(...) reads fine in throwaway config assembly.
+    "E731",   # Short lambdas are the point in a probe script.
+    "E741",   # `l` for a length/level in dense numeric code.
+    "PT018",  # Composite asserts outside a test suite.
+    "PLW2901",
+    "PLC0206",
+    "PIE810",
+    "RET504", # Named intermediates document the maths.
+    "RUF007",
+    "SIM108",
+    "UP031",
+]
+# The warmup pass has to drive the exact private call path real inference uses
+# (policy._sample_actions with policy._sample_kwargs); anything else would compile
+# a different graph than the one requests actually hit.
+"scripts/serve_policy.py" = ["SLF001"]
+
 [tool.ruff.lint.isort]
 force-single-line = true
 force-sort-within-sections = true

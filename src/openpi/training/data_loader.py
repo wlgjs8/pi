@@ -196,8 +196,11 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             *([_transforms.AugmentImages(data_config.image_aug)] if data_config.image_aug is not None else []),
             # Before Normalize on purpose: normalisation is per-dimension, so rotating x/y
             # pairs afterwards would mix dims carrying different scales.
-            *([_transforms.RotAugEgoWrist(deg=data_config.rot_aug_deg)]
-              if getattr(data_config, 'rot_aug_deg', 0.0) > 0 else []),
+            *(
+                [_transforms.RotAugEgoWrist(deg=data_config.rot_aug_deg)]
+                if getattr(data_config, "rot_aug_deg", 0.0) > 0
+                else []
+            ),
             *([_transforms.InjectDartNoise(data_config.dart_noise)] if data_config.dart_noise is not None else []),
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             # AFTER Normalize so the sentinel is what the pi05 tokenizer discretizes into the
@@ -240,8 +243,11 @@ def transform_iterable_dataset(
             *([_transforms.AugmentImages(data_config.image_aug)] if data_config.image_aug is not None else []),
             # Before Normalize on purpose: normalisation is per-dimension, so rotating x/y
             # pairs afterwards would mix dims carrying different scales.
-            *([_transforms.RotAugEgoWrist(deg=data_config.rot_aug_deg)]
-              if getattr(data_config, 'rot_aug_deg', 0.0) > 0 else []),
+            *(
+                [_transforms.RotAugEgoWrist(deg=data_config.rot_aug_deg)]
+                if getattr(data_config, "rot_aug_deg", 0.0) > 0
+                else []
+            ),
             *([_transforms.InjectDartNoise(data_config.dart_noise)] if data_config.dart_noise is not None else []),
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,

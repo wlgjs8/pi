@@ -22,30 +22,43 @@ dinov3/hub/backbones.py, and the load is strict=True so a mismatch is an error, 
 NO GEOMETRIC AUGMENTATION. The target is a geometric quantity in the camera frame; a crop or flip
 changes the correct answer. Photometric jitter only.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import pathlib
-import sys
 
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn as nn
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 # From dinov3/hub/backbones.py. NOT the DinoVisionTransformer defaults -- see module docstring.
 VIT_COMMON = dict(
-    img_size=224, patch_size=16, in_chans=3, pos_embed_rope_base=100,
-    pos_embed_rope_normalize_coords="separate", pos_embed_rope_rescale_coords=2,
-    pos_embed_rope_dtype="fp32", ffn_ratio=4, qkv_bias=True, drop_path_rate=0.0,
-    layerscale_init=1.0e-05, norm_layer="layernormbf16", ffn_layer="mlp",
-    ffn_bias=True, proj_bias=True, n_storage_tokens=4, mask_k_bias=True,
+    img_size=224,
+    patch_size=16,
+    in_chans=3,
+    pos_embed_rope_base=100,
+    pos_embed_rope_normalize_coords="separate",
+    pos_embed_rope_rescale_coords=2,
+    pos_embed_rope_dtype="fp32",
+    ffn_ratio=4,
+    qkv_bias=True,
+    drop_path_rate=0.0,
+    layerscale_init=1.0e-05,
+    norm_layer="layernormbf16",
+    ffn_layer="mlp",
+    ffn_bias=True,
+    proj_bias=True,
+    n_storage_tokens=4,
+    mask_k_bias=True,
 )
 VIT_SIZES = {
     "s": (dict(embed_dim=384, depth=12, num_heads=6), "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"),
@@ -64,7 +77,7 @@ class GraspSet(Dataset):
         self.ep = m["ep"][keep]
         self.arm = m["arm"][keep]
         self.L = m["L"][keep]
-        self.y = m["target_pos"][keep].astype(np.float32)     # metres, ee_local at t
+        self.y = m["target_pos"][keep].astype(np.float32)  # metres, ee_local at t
         self.state = m["state"][keep].astype(np.float32)
         self.dir = root / "images" / split
         self.hw = hw
@@ -72,6 +85,7 @@ class GraspSet(Dataset):
         self.jitter = jitter
         if jitter:
             from torchvision.transforms import v2
+
             self.aug = v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.03)
 
     def __len__(self):
@@ -99,11 +113,12 @@ class Regressor(nn.Module):
         d = 0
         if image:
             from dinov3.models.vision_transformer import DinoVisionTransformer
+
             dims, ckpt = VIT_SIZES[size]
             self.backbone = DinoVisionTransformer(**VIT_COMMON, **dims)
             sd = torch.load(weights_dir / ckpt, map_location="cpu")
             self.backbone.load_state_dict(sd.get("model", sd), strict=True)  # strict: see docstring
-            d += dims["embed_dim"] * 2                                       # cls + mean patch token
+            d += dims["embed_dim"] * 2  # cls + mean patch token
         if use_state:
             d += 14
         self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 512), nn.GELU(), nn.Linear(512, 3))
@@ -140,10 +155,14 @@ def evaluate(model, loader, dev, ds):
     for x, y, s, idx in loader:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             p = model(x.to(dev, non_blocking=True), s.to(dev, non_blocking=True))
-        P.append(p.float().cpu()); Y.append(y); I.append(idx)
-    P = torch.cat(P).numpy(); Y = torch.cat(Y).numpy(); I = torch.cat(I).numpy()
-    e = (P - Y) * 1000.0                         # mm
-    out = {"n_all": int(len(I)), "rmse_all_mm": float(np.sqrt((e ** 2).sum(1).mean()))}
+        P.append(p.float().cpu())
+        Y.append(y)
+        I.append(idx)
+    P = torch.cat(P).numpy()
+    Y = torch.cat(Y).numpy()
+    I = torch.cat(I).numpy()
+    e = (P - Y) * 1000.0  # mm
+    out = {"n_all": int(len(I)), "rmse_all_mm": float(np.sqrt((e**2).sum(1).mean()))}
     # Report at the SAME lookaheads the VLA metric uses so the cells line up one-for-one.
     for L in (12, 23):
         for a, an in ((1, "right"), (0, "left")):
@@ -156,11 +175,12 @@ def evaluate(model, loader, dev, ds):
                 "bias_mm": {ax: float(ee[:, k].mean()) for k, ax in enumerate("xyz")},
                 "scatter_mm": {ax: float(ee[:, k].std(ddof=1)) for k, ax in enumerate("xyz")},
                 "rmse_mm": {ax: float(np.sqrt((ee[:, k] ** 2).mean())) for k, ax in enumerate("xyz")},
-                "rmse_norm_mm": float(np.sqrt((ee ** 2).sum(1).mean())),
+                "rmse_norm_mm": float(np.sqrt((ee**2).sum(1).mean())),
                 # r2 against "predict the mean required displacement" -- the same reference the VLA
                 # metric uses, so 0 means "ignores where the bolt is".
-                "r2_vs_mean": {ax: float(1 - ee[:, k].var() / max(yy[:, k].var(), 1e-12))
-                               for k, ax in enumerate("xyz")},
+                "r2_vs_mean": {
+                    ax: float(1 - ee[:, k].var() / max(yy[:, k].var(), 1e-12)) for k, ax in enumerate("xyz")
+                },
             }
     return out
 
@@ -189,24 +209,43 @@ def main() -> None:
     dev = "cuda"
     tr = GraspSet(root, "train", hw, args.arm, jitter=True, blind=args.blind)
     va = GraspSet(root, "val", hw, args.arm, jitter=False, blind=args.blind)
-    print(f"train {len(tr)} rows / {len(set(tr.ep.tolist()))} episodes | "
-          f"val {len(va)} rows / {len(set(va.ep.tolist()))} episodes", flush=True)
+    print(
+        f"train {len(tr)} rows / {len(set(tr.ep.tolist()))} episodes | "
+        f"val {len(va)} rows / {len(set(va.ep.tolist()))} episodes",
+        flush=True,
+    )
 
-    ltr = DataLoader(tr, batch_size=args.batch, shuffle=True, num_workers=args.workers,
-                     pin_memory=True, drop_last=True, persistent_workers=args.workers > 0)
-    lva = DataLoader(va, batch_size=args.batch, shuffle=False, num_workers=args.workers,
-                     pin_memory=True, persistent_workers=args.workers > 0)
+    ltr = DataLoader(
+        tr,
+        batch_size=args.batch,
+        shuffle=True,
+        num_workers=args.workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=args.workers > 0,
+    )
+    lva = DataLoader(
+        va,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+        persistent_workers=args.workers > 0,
+    )
 
-    model = Regressor(args.size, pathlib.Path(args.weights_dir),
-                      use_state=args.use_state or args.no_image, image=not args.no_image).to(dev)
+    model = Regressor(
+        args.size, pathlib.Path(args.weights_dir), use_state=args.use_state or args.no_image, image=not args.no_image
+    ).to(dev)
     opt = torch.optim.AdamW(param_groups(model, args.lr, args.head_lr), weight_decay=0.05)
     steps = args.epochs * len(ltr)
     sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: min(1.0, s / max(1, int(0.05 * steps))) * 0.5 * (1 + math.cos(math.pi * s / steps)))
+        opt, lambda s: min(1.0, s / max(1, int(0.05 * steps))) * 0.5 * (1 + math.cos(math.pi * s / steps))
+    )
 
     best, best_ep, hist = None, -1, []
     for ep in range(args.epochs):
-        model.train(); tot = n = 0.0
+        model.train()
+        tot = n = 0.0
         for x, y, s, _ in ltr:
             x, y, s = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True), s.to(dev, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -214,25 +253,50 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sched.step()
-            tot += loss.item() * len(x); n += len(x)
+            opt.step()
+            sched.step()
+            tot += loss.item() * len(x)
+            n += len(x)
         m = evaluate(model, lva, dev, va)
         key = m.get("right_L23", {}).get("scatter_mm", {}).get("z", float("inf"))
-        hist.append({"epoch": ep, "train_mse": tot / n, "val_rmse_all_mm": m["rmse_all_mm"],
-                     "right_L23_z_scatter_mm": key})
-        print(f"ep {ep:2d}  train_mse {tot / n:.5f}  val_rmse_all {m['rmse_all_mm']:6.2f} mm  "
-              f"right_L23_z_scatter {key:6.2f} mm", flush=True)
+        hist.append(
+            {"epoch": ep, "train_mse": tot / n, "val_rmse_all_mm": m["rmse_all_mm"], "right_L23_z_scatter_mm": key}
+        )
+        print(
+            f"ep {ep:2d}  train_mse {tot / n:.5f}  val_rmse_all {m['rmse_all_mm']:6.2f} mm  "
+            f"right_L23_z_scatter {key:6.2f} mm",
+            flush=True,
+        )
         # Select on the pre-registered quantity, not on the training loss.
         if best is None or key < best.get("right_L23", {}).get("scatter_mm", {}).get("z", float("inf")):
             best, best_ep = m, ep
 
-    out = {"tag": args.tag, "size": args.size, "hw": hw, "arm": args.arm,
-           "blind": args.blind, "no_image": args.no_image, "use_state": args.use_state,
-           "epochs": args.epochs, "best_epoch": best_ep, "history": hist, "best": best}
+    out = {
+        "tag": args.tag,
+        "size": args.size,
+        "hw": hw,
+        "arm": args.arm,
+        "blind": args.blind,
+        "no_image": args.no_image,
+        "use_state": args.use_state,
+        "epochs": args.epochs,
+        "best_epoch": best_ep,
+        "history": hist,
+        "best": best,
+    }
     p = pathlib.Path(args.root) / f"result_{args.tag}.json"
     p.write_text(json.dumps(out, indent=2))
-    print(json.dumps({"tag": args.tag, "best_epoch": best_ep,
-                      "right_L23": best.get("right_L23"), "right_L12": best.get("right_L12")}, indent=2))
+    print(
+        json.dumps(
+            {
+                "tag": args.tag,
+                "best_epoch": best_ep,
+                "right_L23": best.get("right_L23"),
+                "right_L12": best.get("right_L12"),
+            },
+            indent=2,
+        )
+    )
     print(f"wrote {p}")
 
 

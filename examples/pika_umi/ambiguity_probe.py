@@ -20,6 +20,7 @@ Two non-parametric measurements, neither of which can overfit:
 
 Comparing (1) against (2) separates "model is weak" from "task is ambiguous".
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,18 +28,31 @@ import json
 import pathlib
 
 import numpy as np
-import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 VIT_COMMON = dict(
-    img_size=224, patch_size=16, in_chans=3, pos_embed_rope_base=100,
-    pos_embed_rope_normalize_coords="separate", pos_embed_rope_rescale_coords=2,
-    pos_embed_rope_dtype="fp32", ffn_ratio=4, qkv_bias=True, drop_path_rate=0.0,
-    layerscale_init=1.0e-05, norm_layer="layernormbf16", ffn_layer="mlp",
-    ffn_bias=True, proj_bias=True, n_storage_tokens=4, mask_k_bias=True,
+    img_size=224,
+    patch_size=16,
+    in_chans=3,
+    pos_embed_rope_base=100,
+    pos_embed_rope_normalize_coords="separate",
+    pos_embed_rope_rescale_coords=2,
+    pos_embed_rope_dtype="fp32",
+    ffn_ratio=4,
+    qkv_bias=True,
+    drop_path_rate=0.0,
+    layerscale_init=1.0e-05,
+    norm_layer="layernormbf16",
+    ffn_layer="mlp",
+    ffn_bias=True,
+    proj_bias=True,
+    n_storage_tokens=4,
+    mask_k_bias=True,
 )
 VIT_SIZES = {
     "s": (dict(embed_dim=384, depth=12, num_heads=6), "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"),
@@ -50,16 +64,18 @@ class Frames(Dataset):
     def __init__(self, root, split, hw, arm):
         m = np.load(root / f"meta_{split}.npz", allow_pickle=True)
         keep = m["arm"] == (1 if arm == "right" else 0)
-        self.name = m["name"][keep]; self.ep = m["ep"][keep]
-        self.L = m["L"][keep]; self.y = m["target_pos"][keep].astype(np.float32)
-        self.dir = root / "images" / split; self.hw = hw
+        self.name = m["name"][keep]
+        self.ep = m["ep"][keep]
+        self.L = m["L"][keep]
+        self.y = m["target_pos"][keep].astype(np.float32)
+        self.dir = root / "images" / split
+        self.hw = hw
 
     def __len__(self):
         return len(self.name)
 
     def __getitem__(self, i):
-        im = Image.open(self.dir / str(self.name[i])).convert("RGB").resize(
-            (self.hw[1], self.hw[0]), Image.BILINEAR)
+        im = Image.open(self.dir / str(self.name[i])).convert("RGB").resize((self.hw[1], self.hw[0]), Image.BILINEAR)
         x = torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1).float() / 255.0
         x = (x - torch.tensor(IMAGENET_MEAN)[:, None, None]) / torch.tensor(IMAGENET_STD)[:, None, None]
         return x, i
@@ -102,10 +118,9 @@ def main() -> None:
     Fva = features(va, model, "cuda", args.batch, args.workers)
     print(f"features: train {tuple(Ftr.shape)}  val {tuple(Fva.shape)}", flush=True)
 
-    Ytr = torch.from_numpy(tr.y) * 1000.0     # mm
+    Ytr = torch.from_numpy(tr.y) * 1000.0  # mm
     Yva = torch.from_numpy(va.y) * 1000.0
-    res = {"arm": args.arm, "size": args.size,
-           "n_train": int(len(tr)), "n_val": int(len(va))}
+    res = {"arm": args.arm, "size": args.size, "n_train": int(len(tr)), "n_val": int(len(va))}
 
     # Restrict to the lookaheads the VLA metric reports, so the numbers are directly comparable.
     for L in (23, 12, 5, 2):
@@ -115,16 +130,16 @@ def main() -> None:
         # Neighbours are drawn from the SAME lookahead: a frame 23 steps out should be compared with
         # frames 23 steps out, otherwise "nearest" trivially means "same distance-to-grasp".
         tm = torch.from_numpy((tr.L == L).astype(bool))
-        S = Fva[vm] @ Ftr[tm].T                      # cosine similarity, both L2-normalised
+        S = Fva[vm] @ Ftr[tm].T  # cosine similarity, both L2-normalised
         yq, yb = Yva[vm], Ytr[tm]
         entry = {"n_val": int(vm.sum()), "n_train": int(tm.sum())}
         for k in (1, 5, 20):
             idx = S.topk(k, dim=1).indices
-            nb = yb[idx]                              # (nval, k, 3)
+            nb = yb[idx]  # (nval, k, 3)
             pred = nb.mean(1)
             e = (pred - yq).numpy()
             entry[f"knn{k}"] = {
-                "rmse_norm_mm": float(np.sqrt((e ** 2).sum(1).mean())),
+                "rmse_norm_mm": float(np.sqrt((e**2).sum(1).mean())),
                 "z_scatter_mm": float(e[:, 2].std(ddof=1)),
                 "z_bias_mm": float(e[:, 2].mean()),
                 "z_rmse_mm": float(np.sqrt((e[:, 2] ** 2).mean())),
@@ -134,7 +149,8 @@ def main() -> None:
                 # sees the image, since these frames are what the encoder considers the same scene.
                 spread = nb.std(dim=1).numpy()
                 entry[f"neighbour_target_spread_mm_k{k}"] = {
-                    ax: float(np.median(spread[:, j])) for j, ax in enumerate("xyz")}
+                    ax: float(np.median(spread[:, j])) for j, ax in enumerate("xyz")
+                }
                 entry[f"neighbour_cosine_k{k}"] = float(S.topk(k, dim=1).values[:, -1].mean())
         res[f"L{L}"] = entry
         print(f"L={L}: " + json.dumps(entry), flush=True)

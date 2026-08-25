@@ -24,9 +24,13 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--inference-delay", type=int, default=3)
-    parser.add_argument("--execute-horizon", type=int, default=6,
-                        help="Must match deploy CHUNK_EXECUTE_STEPS (openpi_remote sends "
-                             "this as execute_horizon; it participates in compile guards).")
+    parser.add_argument(
+        "--execute-horizon",
+        type=int,
+        default=6,
+        help="Must match deploy CHUNK_EXECUTE_STEPS (openpi_remote sends "
+        "this as execute_horizon; it participates in compile guards).",
+    )
     parser.add_argument("--schedule", default="exp")
     parser.add_argument("--max-guidance-weight", type=float, default=5.0)
     parser.add_argument("--repeats", type=int, default=3)

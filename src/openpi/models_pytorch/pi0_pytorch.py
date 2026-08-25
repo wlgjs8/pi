@@ -113,9 +113,7 @@ class PI0Pytorch(nn.Module):
         self.aux_color_weight = float(getattr(config, "aux_color_weight", 0.0))
         self._aux_img_embs = None
         if self.aux_color_weight > 0:
-            self.aux_color_head = nn.Sequential(
-                nn.Linear(paligemma_config.width, 256), nn.GELU(), nn.Linear(256, 2)
-            )
+            self.aux_color_head = nn.Sequential(nn.Linear(paligemma_config.width, 256), nn.GELU(), nn.Linear(256, 2))
             ik = list(config.image_keys)
             self._wrist_idx = {
                 "right": ik.index("right_wrist_0_rgb") if "right_wrist_0_rgb" in ik else None,
@@ -176,7 +174,9 @@ class PI0Pytorch(nn.Module):
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(
-            observation, train=train, image_keys=self.config.image_keys,
+            observation,
+            train=train,
+            image_keys=self.config.image_keys,
             photometric_aug=getattr(self.config, "photometric_aug", True),
         )
         return (
@@ -405,7 +405,7 @@ class PI0Pytorch(nn.Module):
         and away from distractor bolts/floor. emb: [b, ntok, dim]. Falls back to whole-image mean if the
         token count isn't a perfect square (e.g. a CLS token present)."""
         b, ntok, d = emb.shape
-        g = int(round(ntok ** 0.5))
+        g = int(round(ntok**0.5))
         if g * g != ntok:
             return emb.mean(dim=1)
         grid = emb.reshape(b, g, g, d)
@@ -440,8 +440,10 @@ class PI0Pytorch(nn.Module):
                 not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             ):
                 acc = (logits[valid].argmax(-1) == labels[valid]).float().mean().item()
-                logging.info(f"[aux-color] step~{self._aux_dbg} valid_frac={valid.float().mean().item():.2f} "
-                             f"ce={ce.item():.4f} train_acc={acc:.2f}")
+                logging.info(
+                    f"[aux-color] step~{self._aux_dbg} valid_frac={valid.float().mean().item():.2f} "
+                    f"ce={ce.item():.4f} train_acc={acc:.2f}"
+                )
             return ce
         return logits.sum() * 0.0  # all-ignore this batch: 0 loss, head still in the graph
 

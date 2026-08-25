@@ -17,17 +17,17 @@ def _bolt_color_labels(prompt) -> tuple[np.ndarray, np.ndarray]:
     dataset columns). Returns (right_label, left_label) each int32[1]; 0=black, 1=gray, -1=ignore.
     Only the arm named in the prompt (the one whose wrist is looking at its target bolt this phase)
     gets a label; the other arm is -1 (ignored by the aux loss). Non-phase_color prompts -> both -1."""
-    r, l = -1, -1
-    if isinstance(prompt, (str, bytes)):
+    right, left = -1, -1
+    if isinstance(prompt, str | bytes):
         s = prompt.decode() if isinstance(prompt, bytes) else prompt
         m = _BOLT_COLOR_RE.search(s)
         if m:
             c = 0 if m.group(1) == "black" else 1
             if m.group(2) == "right":
-                r = c
+                right = c
             else:
-                l = c
-    return np.array([r], dtype=np.int32), np.array([l], dtype=np.int32)
+                left = c
+    return np.array([right], dtype=np.int32), np.array([left], dtype=np.int32)
 
 
 def _anchor_relative_chunk(actions: np.ndarray) -> np.ndarray:
@@ -43,10 +43,10 @@ def _anchor_relative_chunk(actions: np.ndarray) -> np.ndarray:
     out = a.copy()
     for base in (0, 7):  # left arm cols 0:7, right arm cols 7:14
         p = a[:, base : base + 3]
-        R = Rotation.from_rotvec(a[:, base + 3 : base + 6])
-        r0_inv = R[0].inv()
+        rot = Rotation.from_rotvec(a[:, base + 3 : base + 6])
+        r0_inv = rot[0].inv()
         out[:, base : base + 3] = r0_inv.apply(p - p[0])
-        out[:, base + 3 : base + 6] = (r0_inv * R).as_rotvec()
+        out[:, base + 3 : base + 6] = (r0_inv * rot).as_rotvec()
         # gripper col (base+6) unchanged -- it is the per-frame target opening
     return out.astype(np.float32)
 
@@ -184,10 +184,14 @@ class PikaUmiInputs(transforms.DataTransformFn):
         if self.aux_color_labels:
             # Per-frame pre-grasp color labels are emitted by the converter (timed, from arm_bolt_colors).
             # Read them from the dataset columns; absent at inference -> -1 (aux loss is training-only).
-            r = data.get("bolt_color_right")
-            l = data.get("bolt_color_left")
-            inputs["bolt_color_right"] = np.asarray(r if r is not None else [-1], dtype=np.int32).reshape(1)
-            inputs["bolt_color_left"] = np.asarray(l if l is not None else [-1], dtype=np.int32).reshape(1)
+            right_lbl = data.get("bolt_color_right")
+            left_lbl = data.get("bolt_color_left")
+            inputs["bolt_color_right"] = np.asarray(
+                right_lbl if right_lbl is not None else [-1], dtype=np.int32
+            ).reshape(1)
+            inputs["bolt_color_left"] = np.asarray(left_lbl if left_lbl is not None else [-1], dtype=np.int32).reshape(
+                1
+            )
 
         return inputs
 

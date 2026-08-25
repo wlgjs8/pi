@@ -11,7 +11,6 @@ Assumes ≤1000 episodes total (single chunk-000) and identical features/fps/tas
     --dest-repo-id plaif/pika_umi_video_train_tcp_gripabs_velproprio_depth
 """
 
-import glob as _glob
 import json
 import pathlib
 import shutil

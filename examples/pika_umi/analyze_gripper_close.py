@@ -17,6 +17,7 @@ a close that is consistent across episodes. So measure, per arm and per episode,
 
 Layout (gripabs, 14 dims): actions[6] = left opening, actions[13] = right opening.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -56,8 +57,19 @@ def main() -> None:
     if args.limit:
         files = files[: args.limit]
 
-    rec = {a: {"onset_frac": [], "dur": [], "open_v": [], "closed_v": [], "settle_v": [],
-               "mid_frames": [], "ep_len": [], "onset_speed": []} for a in ARMS}
+    rec = {
+        a: {
+            "onset_frac": [],
+            "dur": [],
+            "open_v": [],
+            "closed_v": [],
+            "settle_v": [],
+            "mid_frames": [],
+            "ep_len": [],
+            "onset_speed": [],
+        }
+        for a in ARMS
+    }
     mid_all = {a: 0 for a in ARMS}
     tot_all = {a: 0 for a in ARMS}
     profiles = {a: [] for a in ARMS}
@@ -88,7 +100,7 @@ def main() -> None:
             rec[arm]["settle_v"].append(float(np.median(tail)) if len(tail) else float(g[e]))
             rec[arm]["mid_frames"].append(int(((g > lo) & (g < hi)).sum()))
             rec[arm]["ep_len"].append(T)
-            rec[arm]["onset_speed"].append(float(np.median(d[max(0, s - 5): s + 1])))
+            rec[arm]["onset_speed"].append(float(np.median(d[max(0, s - 5) : s + 1])))
             # normalized close profile (10 samples between onset and completion)
             if e > s:
                 xs = np.linspace(s, e, 10)
@@ -103,31 +115,40 @@ def main() -> None:
     for arm in ARMS:
         du = np.array(rec[arm]["dur"], float)
         on = np.array(rec[arm]["onset_frac"], float)
-        print(f"{arm:<7} {len(du):>5} "
-              f"p10={q(du,10):>5.0f} p50={q(du,50):>5.0f} p90={q(du,90):>5.0f} "
-              f"{du.std()/max(du.mean(),1e-9):>6.2f} "
-              f"p10={q(on,10):>5.2f} p50={q(on,50):>5.2f} p90={q(on,90):>5.2f} "
-              f"{on.std()/max(on.mean(),1e-9):>6.2f}")
+        print(
+            f"{arm:<7} {len(du):>5} "
+            f"p10={q(du,10):>5.0f} p50={q(du,50):>5.0f} p90={q(du,90):>5.0f} "
+            f"{du.std()/max(du.mean(),1e-9):>6.2f} "
+            f"p10={q(on,10):>5.2f} p50={q(on,50):>5.2f} p90={q(on,90):>5.2f} "
+            f"{on.std()/max(on.mean(),1e-9):>6.2f}"
+        )
 
-    print(f"\n그리퍼 개도 값 분포 (열림 / 완전닫힘 / 안착값)")
-    print(f"{'':<7} {'open p50':>9} {'open CV':>8} {'settle p10':>11} {'settle p50':>11} {'settle p90':>11} {'settle CV':>10}")
+    print("\n그리퍼 개도 값 분포 (열림 / 완전닫힘 / 안착값)")
+    print(
+        f"{'':<7} {'open p50':>9} {'open CV':>8} {'settle p10':>11} {'settle p50':>11} {'settle p90':>11} {'settle CV':>10}"
+    )
     print("-" * 74)
     for arm in ARMS:
-        ov = np.array(rec[arm]["open_v"], float); sv = np.array(rec[arm]["settle_v"], float)
-        print(f"{arm:<7} {q(ov,50):>9.3f} {ov.std()/max(abs(ov.mean()),1e-9):>8.2f} "
-              f"{q(sv,10):>11.3f} {q(sv,50):>11.3f} {q(sv,90):>11.3f} {sv.std()/max(abs(sv.mean()),1e-9):>10.2f}")
+        ov = np.array(rec[arm]["open_v"], float)
+        sv = np.array(rec[arm]["settle_v"], float)
+        print(
+            f"{arm:<7} {q(ov,50):>9.3f} {ov.std()/max(abs(ov.mean()),1e-9):>8.2f} "
+            f"{q(sv,10):>11.3f} {q(sv,50):>11.3f} {q(sv,90):>11.3f} {sv.std()/max(abs(sv.mean()),1e-9):>10.2f}"
+        )
 
-    print(f"\n애매 구간(열림·닫힘 어느 쪽도 아닌 중간 밴드) 비중")
+    print("\n애매 구간(열림·닫힘 어느 쪽도 아닌 중간 밴드) 비중")
     for arm in ARMS:
-        print(f"  {arm:<6} {mid_all[arm]}/{tot_all[arm]} = {100.0*mid_all[arm]/max(tot_all[arm],1):.1f}%  "
-              f"(에피소드당 p50 {q(np.array(rec[arm]['mid_frames'],float),50):.0f} 프레임)")
+        print(
+            f"  {arm:<6} {mid_all[arm]}/{tot_all[arm]} = {100.0*mid_all[arm]/max(tot_all[arm],1):.1f}%  "
+            f"(에피소드당 p50 {q(np.array(rec[arm]['mid_frames'],float),50):.0f} 프레임)"
+        )
 
-    print(f"\n닫힘 시작 직전 팔 속도 (mm/step)")
+    print("\n닫힘 시작 직전 팔 속도 (mm/step)")
     for arm in ARMS:
         sp = np.array(rec[arm]["onset_speed"], float)
         print(f"  {arm:<6} p10={q(sp,10):.2f} p50={q(sp,50):.2f} p90={q(sp,90):.2f}")
 
-    print(f"\n정규화 닫힘 프로파일 (0=시작, 1=완료 / 값은 개도 정규화, 에피소드 간 표준편차)")
+    print("\n정규화 닫힘 프로파일 (0=시작, 1=완료 / 값은 개도 정규화, 에피소드 간 표준편차)")
     print(f"{'':<7} " + " ".join(f"{x:>5.2f}" for x in np.linspace(0, 1, 10)))
     for arm in ARMS:
         P = np.array(profiles[arm])

@@ -90,7 +90,9 @@ def _arm_actions(pose: np.ndarray, grip: np.ndarray) -> np.ndarray:
     return np.concatenate([pos_delta_local, rot_delta, grip_delta], axis=1).astype(np.float32)
 
 
-def _actions(left_pose: np.ndarray, right_pose: np.ndarray, left_grip: np.ndarray, right_grip: np.ndarray) -> np.ndarray:
+def _actions(
+    left_pose: np.ndarray, right_pose: np.ndarray, left_grip: np.ndarray, right_grip: np.ndarray
+) -> np.ndarray:
     return np.concatenate(
         [
             _arm_actions(left_pose, left_grip),

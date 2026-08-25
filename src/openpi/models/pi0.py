@@ -82,8 +82,12 @@ class Pi0(_model.BaseModel):
             # launched for). Do not trust "it should be on" -- read it in the log.
             logging.info(
                 "pi0: transition loss ACTIVE grip=%s pose=%s window=%s grip_dims=%s pose_dims=%s",
-                self.grip_loss_weight, self.pose_loss_weight, self.grip_loss_window,
-                self.grip_dims, self.pose_dims)
+                self.grip_loss_weight,
+                self.pose_loss_weight,
+                self.grip_loss_window,
+                self.grip_dims,
+                self.pose_dims,
+            )
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -210,7 +214,10 @@ class Pi0(_model.BaseModel):
         # Pass image_keys=actual keys (like pi0_fast) so EXTRA image streams (e.g. *_wrist_0_depth from
         # include_depth) survive preprocessing instead of being silently dropped to the default 3 RGB keys.
         observation = _model.preprocess_observation(
-            preprocess_rng, observation, train=train, image_keys=list(observation.images.keys()),
+            preprocess_rng,
+            observation,
+            train=train,
+            image_keys=list(observation.images.keys()),
             image_resolution=self.image_resolution,
         )
 
@@ -247,11 +254,11 @@ class Pi0(_model.BaseModel):
 
         Returns a tensor broadcastable to `shape` whose mean is 1 per sample, so the loss scale
         is untouched and only its distribution moves."""
-        ah, ad = shape[-2], shape[-1]
+        ad = shape[-1]
         dims = [d for d in self.grip_dims if d < ad]
         if not dims:
             return jnp.ones(shape, dtype=actions.dtype)
-        g = actions[..., jnp.array(dims)]                       # (*b, ah, n_grip)
+        g = actions[..., jnp.array(dims)]  # (*b, ah, n_grip)
         # Row-to-row change of the ground-truth gripper command; row 0 has no predecessor.
         d = jnp.abs(g - jnp.concatenate([g[..., :1, :], g[..., :-1, :]], axis=-2))
         # A transition is any row whose change exceeds a small fraction of the full range.
@@ -268,16 +275,15 @@ class Pi0(_model.BaseModel):
             dil = jnp.maximum(dil, jnp.maximum(fwd, bwd))
         w = jnp.ones(shape, dtype=actions.dtype)
         if self.grip_loss_weight is not None:
-            gw = 1.0 + (self.grip_loss_weight - 1.0) * dil       # (*b, ah, n_grip)
+            gw = 1.0 + (self.grip_loss_weight - 1.0) * dil  # (*b, ah, n_grip)
             w = w.at[..., jnp.array(dims)].set(gw)
         if self.pose_loss_weight is not None:
             pdims = [d for d in self.pose_dims if d < ad]
             if pdims:
                 # One detector, two targets: the grip transition marks the grasp, so the same
                 # mask up-weights the TRANSLATION rows that decide where the fingers land.
-                m = jnp.max(dil, axis=-1, keepdims=True)         # (*b, ah, 1)
-                pw = 1.0 + (self.pose_loss_weight - 1.0) * jnp.broadcast_to(
-                    m, (*m.shape[:-1], len(pdims)))
+                m = jnp.max(dil, axis=-1, keepdims=True)  # (*b, ah, 1)
+                pw = 1.0 + (self.pose_loss_weight - 1.0) * jnp.broadcast_to(m, (*m.shape[:-1], len(pdims)))
                 w = w.at[..., jnp.array(pdims)].set(pw)
         # Renormalise per sample so the loss magnitude -- and therefore what the LR means --
         # is identical to the unweighted run.
@@ -308,7 +314,10 @@ class Pi0(_model.BaseModel):
         presence/absence of RTC selects between the two compiled graphs.
         """
         observation = _model.preprocess_observation(
-            None, observation, train=False, image_keys=list(observation.images.keys()),
+            None,
+            observation,
+            train=False,
+            image_keys=list(observation.images.keys()),
             image_resolution=self.image_resolution,
         )
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -380,9 +389,7 @@ class Pi0(_model.BaseModel):
         def rtc_step(carry):
             x_t, time = carry
             x_t = _rtc_jax.freeze_prefix(x_t, prev, freeze_mask)
-            v_t = _rtc_jax.guided_step_velocity(
-                lambda x: velocity(x, time), x_t, time, prev, weights, max_gw
-            )
+            v_t = _rtc_jax.guided_step_velocity(lambda x: velocity(x, time), x_t, time, prev, weights, max_gw)
             return x_t + dt * v_t, time + dt
 
         x_0, _ = jax.lax.while_loop(cond, rtc_step, (noise, 1.0))

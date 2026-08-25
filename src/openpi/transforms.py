@@ -273,9 +273,9 @@ class DartNoiseConfig:
     rotation + gripper untouched. Mainly hardens POSE/proprio drift (the 'deltas accumulate to a wrong
     absolute position' failure); visual covariate shift still needs collection-time noise / on-policy data."""
 
-    sigma_pos_m: float = 0.01   # body-frame translation noise std (m)
-    recover_steps: int = 5      # spread the recovery over the first K chunk steps (each absorbs eps/K)
-    prob: float = 1.0           # per-arm probability of applying the perturbation
+    sigma_pos_m: float = 0.01  # body-frame translation noise std (m)
+    recover_steps: int = 5  # spread the recovery over the first K chunk steps (each absorbs eps/K)
+    prob: float = 1.0  # per-arm probability of applying the perturbation
 
 
 def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
@@ -286,8 +286,8 @@ def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
         return np.eye(3, dtype=np.float32)
     k = rotvec / theta
     kx = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
-    R = np.eye(3) + np.sin(theta) * kx + (1.0 - np.cos(theta)) * (kx @ kx)
-    return R.astype(np.float32)
+    rot = np.eye(3) + np.sin(theta) * kx + (1.0 - np.cos(theta)) * (kx @ kx)
+    return rot.astype(np.float32)
 
 
 # Velocity-proprio dims of the 14-D velocity_grip state (gripper sits at 6/13 and is always kept:
@@ -353,15 +353,17 @@ class InjectDartNoise(DataTransformFn):
         actions = np.asarray(data["actions"], dtype=np.float32).copy()
         if actions.ndim != 2 or actions.shape[1] < 14 or state.shape[0] < 14:
             return data
-        H = actions.shape[0]
-        K = max(1, min(self.cfg.recover_steps, H))
+        horizon = actions.shape[0]
+        k_steps = max(1, min(self.cfg.recover_steps, horizon))
         for pos, rot in (([0, 1, 2], [3, 4, 5]), ([7, 8, 9], [10, 11, 12])):
             if np.random.random() > self.cfg.prob:
                 continue
             eps = np.random.normal(0.0, self.cfg.sigma_pos_m, size=3).astype(np.float32)  # body-frame
-            R_rel = _rotvec_to_matrix(state[rot])  # exp(rot_rel) = R0^-1 R_t : body -> reset frame
-            state[pos] = state[pos] + R_rel @ eps  # proprio now reports the displaced pose
-            actions[:K, pos] = actions[:K, pos] - (eps / K)  # first K deltas recover toward the demo
+            r_rel = _rotvec_to_matrix(state[rot])  # exp(rot_rel) = R0^-1 R_t : body -> reset frame
+            state[pos] = state[pos] + r_rel @ eps  # proprio now reports the displaced pose
+            actions[:k_steps, pos] = actions[:k_steps, pos] - (
+                eps / k_steps
+            )  # first k_steps deltas recover toward the demo
         data = dict(data)
         data["state"] = state
         data["actions"] = actions

@@ -5,7 +5,6 @@ equations); here we require the JAX port to reproduce it numerically, including
 the full openpi-convention guided Euler loop that pi0.sample_actions runs.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest

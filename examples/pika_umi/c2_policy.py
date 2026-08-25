@@ -27,6 +27,7 @@ Faithfulness notes (verified against openpi gemma.py / pi0.py):
     pass + 10 cheap suffix passes). Training uses the SAME two-pass structure, so train and
     inference are self-consistent.
 """
+
 from __future__ import annotations
 
 import math
@@ -55,9 +56,9 @@ def apply_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     x = x.float()
     d = x.shape[-1]
     freq_exp = (2.0 / d) * torch.arange(d // 2, device=x.device, dtype=torch.float32)
-    timescale = 10_000.0 ** freq_exp
+    timescale = 10_000.0**freq_exp
     radians = positions.float()[..., None] / timescale[None, None, :]
-    radians = radians[..., None, :]                     # (B, L, 1, d/2)
+    radians = radians[..., None, :]  # (B, L, 1, d/2)
     sin, cos = torch.sin(radians), torch.cos(radians)
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dt)
@@ -86,17 +87,17 @@ class ExpertBlock(nn.Module):
         self.ffw_mod_b = nn.Parameter(torch.empty(3 * D))
 
     def _modulate(self, x, cond, k, b):
-        mod = cond @ k + b                              # (B, 3D) in cond dtype
+        mod = cond @ k + b  # (B, 3D) in cond dtype
         scale, shift, gate = mod[:, None, :].chunk(3, dim=-1)
         h = _rms(x) * (1.0 + scale.float()) + shift.float()
         return h.to(x.dtype), gate
 
     def _qkv(self, h, positions):
-        q = torch.einsum("btd,hdk->bthk", h, self.q_w) * (HEAD_DIM ** -0.5)
+        q = torch.einsum("btd,hdk->bthk", h, self.q_w) * (HEAD_DIM**-0.5)
         k = torch.einsum("btd,dk->btk", h, self.kv_w[0, 0])[:, :, None, :]
-        v = torch.einsum("btd,dk->btk", h, self.kv_w[1, 0])                   # (B,T,Dh)
+        v = torch.einsum("btd,dk->btk", h, self.kv_w[1, 0])  # (B,T,Dh)
         q = apply_rope(q, positions)
-        k = apply_rope(k, positions)[:, :, 0, :]                              # (B,T,Dh)
+        k = apply_rope(k, positions)[:, :, 0, :]  # (B,T,Dh)
         return q, k, v
 
     def _mlp(self, x, cond):
@@ -110,11 +111,11 @@ class ExpertBlock(nn.Module):
         Memory: avoids materialising the (T x T) probs that OOM'd the einsum path at batch 64.
         q (B,T,H,Dh); k, v (B,S,Dh) single KV head broadcast to all query heads (GQA kv=1)."""
         B, T, H, Dh = q.shape
-        qp = q.permute(0, 2, 1, 3)                                   # (B,H,T,Dh)
+        qp = q.permute(0, 2, 1, 3)  # (B,H,T,Dh)
         kp = k[:, None].expand(B, H, k.shape[1], Dh)
         vp = v[:, None].expand(B, H, v.shape[1], Dh)
         o = F.scaled_dot_product_attention(qp, kp, vp, scale=1.0)
-        return o.permute(0, 2, 1, 3)                                 # (B,T,H,Dh)
+        return o.permute(0, 2, 1, 3)  # (B,T,H,Dh)
 
     def prefix_forward(self, x, zero_cond, positions):
         """Full self-attention within the prefix; returns (x_out, (k, v)) for the suffix cache."""
@@ -140,15 +141,21 @@ class ExpertBlock(nn.Module):
 class C2Policy(nn.Module):
     """SigLIP (pi05_base) -> [512 vision + 14 state tokens] -> pretrained 300M expert flow head."""
 
-    def __init__(self, size: str, weights_dir: pathlib.Path, horizon: int,
-                 state_bins: int = 256, **_ignored) -> None:
+    def __init__(self, size: str, weights_dir: pathlib.Path, horizon: int, state_bins: int = 256, **_ignored) -> None:
         super().__init__()
-        from transformers import SiglipVisionConfig, SiglipVisionModel
+        from transformers import SiglipVisionConfig
+        from transformers import SiglipVisionModel
 
         weights_dir = pathlib.Path(weights_dir)
-        cfg = SiglipVisionConfig(hidden_size=1152, intermediate_size=4304, num_hidden_layers=27,
-                                 num_attention_heads=16, image_size=224, patch_size=14,
-                                 vision_use_head=False)
+        cfg = SiglipVisionConfig(
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_hidden_layers=27,
+            num_attention_heads=16,
+            image_size=224,
+            patch_size=14,
+            vision_use_head=False,
+        )
         self.backbone = SiglipVisionModel(cfg)
         sd = torch.load(weights_dir / "siglip_so400m_pi05base.pth", map_location="cpu")
         missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
@@ -166,8 +173,11 @@ class C2Policy(nn.Module):
         self.blocks = nn.ModuleList([ExpertBlock() for _ in range(DEPTH)])
         with torch.no_grad():
             for i, blk in enumerate(self.blocks):
-                blk.q_w.copy_(ex["q_w"][i]); blk.kv_w.copy_(ex["kv_w"][i]); blk.o_w.copy_(ex["o_w"][i])
-                blk.mlp_gating.copy_(ex["mlp_gating"][i]); blk.mlp_linear.copy_(ex["mlp_linear"][i])
+                blk.q_w.copy_(ex["q_w"][i])
+                blk.kv_w.copy_(ex["kv_w"][i])
+                blk.o_w.copy_(ex["o_w"][i])
+                blk.mlp_gating.copy_(ex["mlp_gating"][i])
+                blk.mlp_linear.copy_(ex["mlp_linear"][i])
                 blk.attn_mod_k.copy_(ex["pre_attention_norm_1_dense_k"][i])
                 blk.attn_mod_b.copy_(ex["pre_attention_norm_1_dense_b"][i])
                 blk.ffw_mod_k.copy_(ex["pre_ffw_norm_1_dense_k"][i])
@@ -178,24 +188,24 @@ class C2Policy(nn.Module):
         def _linear(k, b):
             lin = nn.Linear(k.shape[0], k.shape[1])
             with torch.no_grad():
-                lin.weight.copy_(k.T); lin.bias.copy_(b)
+                lin.weight.copy_(k.T)
+                lin.bias.copy_(b)
             return lin
 
-        self.action_in = _linear(ex["action_in_proj_k"], ex["action_in_proj_b"])      # 32 -> 1024
-        self.action_out = _linear(ex["action_out_proj_k"], ex["action_out_proj_b"])   # 1024 -> 32
+        self.action_in = _linear(ex["action_in_proj_k"], ex["action_in_proj_b"])  # 32 -> 1024
+        self.action_out = _linear(ex["action_out_proj_k"], ex["action_out_proj_b"])  # 1024 -> 32
         self.time_in = _linear(ex["time_mlp_in_k"], ex["time_mlp_in_b"])
         self.time_out = _linear(ex["time_mlp_out_k"], ex["time_mlp_out_b"])
 
     # --- VAPolicy-compatible surface -------------------------------------------------------
     def encode(self, img_l, img_r, state):
         b = img_l.shape[0]
-        tok = self.backbone(torch.cat([img_l, img_r], 0)).last_hidden_state       # (2B,256,1152)
+        tok = self.backbone(torch.cat([img_l, img_r], 0)).last_hidden_state  # (2B,256,1152)
         tok = self.vis_proj(tok)
-        vis = torch.cat([tok[:b], tok[b:]], dim=1)                                # (B,512,1024)
-        idx = torch.clamp(torch.floor((state.float() + 1.0) / 2.0 * self.state_bins).long(),
-                          0, self.state_bins - 1)
-        st_tok = (self.state_vocab(idx) + self.state_dim_emb).to(vis.dtype)       # (B,14,1024)
-        return torch.cat([vis, st_tok], dim=1)                                    # (B,526,1024)
+        vis = torch.cat([tok[:b], tok[b:]], dim=1)  # (B,512,1024)
+        idx = torch.clamp(torch.floor((state.float() + 1.0) / 2.0 * self.state_bins).long(), 0, self.state_bins - 1)
+        st_tok = (self.state_vocab(idx) + self.state_dim_emb).to(vis.dtype)  # (B,14,1024)
+        return torch.cat([vis, st_tok], dim=1)  # (B,526,1024)
 
     def precompute(self, ctx):
         """One time-independent prefix pass (cond = zeros -> bias-only adaRMS); returns the
@@ -215,15 +225,15 @@ class C2Policy(nn.Module):
 
     def suffix_pass(self, cache, prefix_len, x_t, t, dtype):
         cond = self._time_cond(t, dtype)
-        x = self.action_in(x_t.to(dtype))                                         # (B,H,1024)
+        x = self.action_in(x_t.to(dtype))  # (B,H,1024)
         b = x.shape[0]
         positions = (prefix_len + torch.arange(self.horizon, device=x.device))[None].expand(b, -1)
-        for blk, kv in zip(self.blocks, cache):
+        for blk, kv in zip(self.blocks, cache, strict=True):
             x = blk.suffix_forward(x, cond, positions, kv)
         mod = cond @ self.final_mod_k + self.final_mod_b
         scale, shift, _ = mod[:, None, :].chunk(3, dim=-1)
         out = (_rms(x) * (1.0 + scale.float()) + shift.float()).to(dtype)
-        return self.action_out(out)                                               # (B,H,32)
+        return self.action_out(out)  # (B,H,32)
 
     def decode(self, ctx, x_t, t):
         cache, p = self.precompute(ctx)
@@ -233,15 +243,13 @@ class C2Policy(nn.Module):
         return self.decode(self.encode(img_l, img_r, state), x_t, t)
 
     @torch.no_grad()
-    def sample_actions(self, img_l, img_r, state, num_steps: int = 10, noise_scale: float = 1.0,
-                       branch: str = "flow"):
+    def sample_actions(self, img_l, img_r, state, num_steps: int = 10, noise_scale: float = 1.0, branch: str = "flow"):
         """Euler integration of openpi's convention (x_t = t*noise + (1-t)*a, u = noise - a).
         Returns (B, H, 14) -- sliced to the real dims for drop-in eval/serve compatibility."""
         ctx = self.encode(img_l, img_r, state)
         cache, p = self.precompute(ctx)
         b = ctx.shape[0]
-        x = noise_scale * torch.randn(b, self.horizon, ACT_DIM,
-                                      device=ctx.device, dtype=torch.float32)
+        x = noise_scale * torch.randn(b, self.horizon, ACT_DIM, device=ctx.device, dtype=torch.float32)
         dt = -1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((b,), 1.0 + i * dt, device=ctx.device, dtype=torch.float32)

@@ -22,19 +22,20 @@ Usage:
       --config pi05_pika_umi_wrist_velgrip_k1_h24_80k \
       --checkpoint-dir /home/plaif/workspace/pika_umi_models_v2/wrist_velgrip_k1_80k/79999
 """
+
 from __future__ import annotations
 
 import argparse
 import statistics
 import time
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
-from flax import nnx
 
 from openpi.models import model as _model
-from openpi.training import config as _config
 import openpi.models.pi0 as _pi0
+from openpi.training import config as _config
 
 
 def _bench(fn, *args, repeat: int, warmup: int) -> tuple[float, float]:

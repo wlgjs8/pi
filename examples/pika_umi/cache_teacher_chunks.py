@@ -12,11 +12,11 @@ identical ego inputs (wrist RGB + body-frame velocity proprio), so no state shor
 Output: one .npz per episode shard with teacher_chunks[t] = teacher's H rows at frame t (unnormalised
 14-D actions). ~178k frames x 8 x 14 fp32 ≈ 80 MB total. Shardable by episode for parallel GPUs.
 """
+
 from __future__ import annotations
 
 import argparse
 import pathlib
-import sys
 
 import numpy as np
 
@@ -41,12 +41,12 @@ def main() -> None:
     args = ap.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
     from openpi.policies import policy_config as _policy_config
     from openpi.training import config as _config
 
     cfg = _config.get_config(args.config)
-    policy = _policy_config.create_trained_policy(
-        cfg, str(pathlib.Path(args.ckpt_base) / str(args.checkpoint_step)))
+    policy = _policy_config.create_trained_policy(cfg, str(pathlib.Path(args.ckpt_base) / str(args.checkpoint_step)))
     H = cfg.model.action_horizon
 
     root = pathlib.Path(args.lerobot_home) / args.repo_id
